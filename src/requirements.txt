@@ -1,0 +1,36 @@
+# ──────────────────────────────────────────────────────────────
+# PokéDINO – Portable Project Dependencies
+# Generated from installed environment on 2026-09-27
+# ──────────────────────────────────────────────────────────────
+
+# Core ML / Vision
+torch==2.10.0
+torchvision==0.25.0
+ultralytics==8.4.154
+opencv-python<5.0,>=4.8.0
+Pillow==12.1.1
+numpy==1.26.4                # anomalydino_src requires numpy < 2.x compat
+scipy==1.17.1
+scikit-learn==1.8.0
+tqdm==4.67.3
+matplotlib==3.10.9
+pandas==2.3.3
+tifffile<=2026.3.3
+
+# Backend (FastAPI web application)
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32
+requests==2.32.5
+aiofiles                 # needed by backend; version not pinned (install latest)
+aiohttp                  # needed by backend; version not pinned (install latest)
+
+# Config & serialization
+PyYAML==6.0.1
+pydantic==2.13.4
+
+# Dataset preparation scripts (optional — only for re-downloading raw data)
+# datasets               # HuggingFace datasets; uncomment if re-downloading card images
+
+# SSL / HTTP
+certifi==2026.2.25

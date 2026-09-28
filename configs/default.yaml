@@ -1,0 +1,180 @@
+# ==============================================================================
+# PokéDINO — Configurazione centrale della pipeline Baseline
+# ==============================================================================
+
+project:
+  name: pokedino
+  seed: 42
+  device: auto            # auto | cpu | mps | cuda
+
+paths:
+  data_dir: data
+  datasets_dir: data/datasets
+  experiments_dir: experiments
+  reference_cache_dir: data/reference_cache
+  uploads_dir: data/uploads
+  report_dir: report
+
+# -- Modulo 1: Rilevamento della carta (YOLO OBB) -----------------------------
+obb:
+  dataset:
+    name: pokemon_obb
+    raw_dir: data/datasets/cards
+    hf_raw_dir: data/datasets/cards/pokemon_official_tcg
+    split: [0.70, 0.15, 0.15]   # train / val / test
+    hard_negative_ratio: 0.06    # Frazione di scene con solo sfondo per abbattere i falsi positivi (best practice YOLO)
+  model:
+    weights: yolo11s-obb.pt
+    imgsz: 640
+  geometry:
+    min_aspect_ratio: 1.15      # Rapporto d'aspetto minimo (tolleranza per inclinazioni prospettiche e scorci)
+    max_aspect_ratio: 1.65      # Rapporto d'aspetto massimo per carta intera standard (88x63mm ~1.40)
+    min_area_frac: 0.06         # Frazione minima dell'area immagine occupata dalla carta (no frammenti)
+  train:
+    epochs: 20
+    batch: 16
+    workers: 2
+    lr0: 0.001
+    lrf: 0.01
+    optimizer: AdamW
+    cos_lr: true
+    patience: 8
+    weight_decay: 0.0005
+    warmup_epochs: 3.0
+    mosaic: 1.0
+    close_mosaic: 5
+    mixup: 0.15
+    erasing: 0.20
+    hsv_h: 0.015
+    hsv_s: 0.7
+    hsv_v: 0.4
+    degrees: 180
+    fliplr: 0.5
+    flipud: 0.5
+    scale: 0.5
+    translate: 0.1
+    perspective: 0.0005
+  inference:
+    conf: 0.12                  # Soglia minima di confidenza (calibrata per rilevare carte complesse o con riflessi)
+    iou: 0.45
+    max_det: 10
+  warp:
+    target_h: 630               # Altezza canonica del ritaglio (formato verticale)
+    target_w: 448               # Larghezza canonica del ritaglio
+
+# -- Quality Gate: Two-stage image quality assessment -------------------------
+quality_gate:
+  # Stage 1: Quick reject on raw image (before YOLO)
+  quick_reject:
+    min_pixel_std: 10.0         # Minimum global pixel std dev to reject near-uniform frames
+    min_laplacian_var: 15.0     # Minimum Laplacian variance to reject extremely blurred frames
+    min_width: 300              # Minimum image width (px) to reject ultra-low-resolution frames
+    min_height: 300             # Minimum image height (px) to reject ultra-low-resolution frames
+  
+  # Stage 2: Detailed quality gate on YOLO OBB crop
+  image_quality:
+    # Metric weights for aggregation (must sum to 1.0)
+    weights:
+      sharpness: 0.35           # Primary differentiator of usable photos
+      exposure: 0.20
+      glare: 0.10               # Rare on crops after blown-out-highlight threshold
+      noise: 0.15
+      resolution: 0.10
+      detection_confidence: 0.05
+      aspect_ratio: 0.03
+      relative_area: 0.02
+    
+    # Hard-reject thresholds (independent of aggregate score)
+    hard_reject:
+      sharpness: 0.15           # Reject if sharpness < 0.15 (Stage 1 already handles
+                                # catastrophic blur; low values also occur on
+                                # low-texture holo artwork of sharp photos)
+      exposure: 0.25            # Reject if exposure < 0.25 (over/under exposed)
+      glare_coverage: 0.50      # Reject if glare covers > 50% of crop
+      noise: 0.10               # Reject if noise score < 0.10
+      resolution: 0.0           # Reject if resolution < minimum (always hard reject)
+      detection_confidence: 0.12 # Reject if YOLO confidence < 0.12 (allineato all'inferenza)
+      aspect_ratio: 0.30        # Reject if aspect ratio score < 0.30
+      relative_area: 0.45       # Reject if card occupies < 15% of frame (too small: warp
+                                # upscale degrades detail, insufficient source pixels)
+    
+    # Resolution requirements
+    min_resolution: [448, 630]  # Minimum (height, width) for DINOv2 input
+    
+    # Framing parameters
+    expected_aspect_ratio: 0.714  # Expected card aspect ratio (height/width, ~2.5:3.5)
+    aspect_ratio_tolerance: 0.30  # Allowed deviation from expected aspect ratio
+    
+    # Aggregate score threshold
+    min_score: 0.35             # Minimum aggregate score to pass
+
+# -- Modulo 2: Equalizzazione CLAHE -------------------------------------------
+clahe:
+  enabled: true
+  clip_limit: 2.0
+  tile_grid_size: [8, 8]
+  apply_to_reference: true
+
+# -- Modulo 3: Rilevamento anomalie superficiali (DINOv2) ---------------------
+anomaly:
+  model: dinov2_vitb14
+  img_size: 448
+  target_size: [630, 448]
+  luma_matching: true          # Global exposure matching of the query toward the reference luminance
+  orientation_canonicalization: true  # Score 0/90/180/270 orientations, keep the best (rotation-invariant inspection)
+  knn_neighbors: 1
+  score_top_percent: 1.0       # Media dell'1% superiore delle distanze dei patch
+  threshold: 0.620             # Soglia decisionale di anomalia calibrata (difettosa vs integra)
+  defect_area_weight: 0.15     # Peso dell'estensione dei difetti sullo score composto (bilanciato a 0.15 per tolleranza foil)
+  defect_pixel_threshold: 0.28 # Soglia di distanza patch oltre la quale è considerata anomalia
+  calibration:
+    n_pristine_cards: 10
+    strategy: percentile_95   # Use 95th percentile of pristine scores (robust to outliers)
+  dead_zone: 0.30              # Noise gate su distanza raw: distanze < dead_zone → blu pieno (filtraggio rumore ottico)
+  gamma: 1.4                   # Esponente non lineare di contrasto dei difetti
+  # Spatial-aware k-NN: vincolo di vicinato spaziale sui match
+  spatial:
+    enabled: true
+    radius_patches: 3.0        # Raggio in patch oltre il quale i match vengono penalizzati
+    penalty_weight: 0.45       # Peso della penalità (0 = disattiva, 1 = maschera totale)
+  # Scoring morfologico dei difetti (clustering connesso)
+  morphology:
+    enabled: true
+    large_cluster_threshold: 25   # Area in patch che fa scattare il bonus di cluster
+    cluster_penalty: 0.005        # Bonus per ogni patch nel cluster più grande sopra soglia
+    linear_eccentricity: 4.0      # Soglia di eccentricità per classificare un graffio lineare
+    linear_penalty: 0.010         # Bonus per ciascun cluster lineare rilevato
+# -- Modulo 4: Classificazione dello stato di conservazione -------------------
+# Scala consolidata a 3 fasce: scelta implementativa per semplificare il
+# compito dell'anomaly detection (le 7 fasce Cardmarket originali erano troppo
+# fine-grained per il segnale disponibile). La suddivisione più fine è
+# rimandata a lavori futuri.
+condition:
+  bands:
+    Near Mint/Mint: 0.450      # Near Mint/Mint (NM): score < 0.450
+    Good/Excellent: 0.750      # Good/Excellent (GE): 0.450 <= score < 0.750
+    Poor/Played: null          # Poor/Played (PP): score >= 0.750
+  labels: [Near Mint/Mint, Good/Excellent, Poor/Played]
+
+# -- Modulo 5: Mascheramento geometrico ---------------------------------------
+masking:
+  enabled: true
+  corner_radius_frac: 0.035    # Raggio di curvatura angoli relativo alla larghezza
+  erode_frac: 0.01             # Erosione perimetrale sottile (4 px su 448) per prevenire infiltrazioni dello sfondo
+  feather_px: 5                # Sfumatura gaussiana del bordo della maschera
+  sam:
+    enabled: false
+    model_type: sam2.1-hiera-small
+
+# -- Modulo 6: Catalogo reference e ricerca -----------------------------------
+catalog:
+  local_catalog_path: data/card_catalog.json
+  api_base: https://api.pokemontcg.io/v2
+  page_size: 50
+  feature_cache_dir: data/reference_cache/dinov2_features  # Cache dei descrittori DINOv2
+
+# -- Gestione sperimentazione -------------------------------------------------
+experiment:
+  save_plots: true
+  plot_dpi: 150
+  log_level: INFO

@@ -1,0 +1,41 @@
+# Python bytecode & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+env/
+venv/
+ENV/
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# PyTorch & Machine Learning model checkpoints
+*.pt
+*.pth
+*.bin
+*.onnx
+
+# Data & Datasets (directory structure preserved via .gitkeep)
+data/datasets/*
+!data/datasets/.gitkeep
+data/weights/*
+!data/weights/.gitkeep
+data/reference_cache/*
+!data/reference_cache/.gitkeep
+data/uploads/*
+!data/uploads/.gitkeep
+data/dinov2_comparison/
+
+# Experimental runs, benchmarks, and training outputs
+experiments/
+report/
+yolo_runs/
+runs/
+
+# Logs & temporary files
+*.log
+scratch/
