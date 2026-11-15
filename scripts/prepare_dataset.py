@@ -7,6 +7,7 @@ Costruisce scene fotorealistiche componendo le carte su sfondi eterogenei:
 4. Generation of dataset statistics and visual audit samples.
 """
 
+import logging
 import random
 import sys
 from pathlib import Path

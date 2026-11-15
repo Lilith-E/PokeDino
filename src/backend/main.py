@@ -11,6 +11,7 @@ The operational pipeline includes:
 
 import logging
 from pathlib import Path
+import time
 from typing import Optional
 
 import cv2
@@ -23,7 +24,8 @@ from pydantic import BaseModel
 
 from backend.pokemon_api import search_cards, get_reference_images_for_card, format_card_display
 from backend.detector import PokemonAnomalyDetector
-from backend.card_detector import CardDetector
+from backend.card_detector import CardDetector, build_card_detector
+from backend.experiment import load_config as _load_config
 from backend.quality_gate import QuickRejectRaw, ImageQualityGate
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -47,7 +49,7 @@ if FRONTEND_DIR.exists():
     app.mount("/app", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
 detector = PokemonAnomalyDetector()
-_card_detector: Optional[CardDetector] = None
+_card_detectors: dict[str, object] = {}
 _manual_reference_info: Optional[dict] = None
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -56,19 +58,19 @@ if not (PROJECT_ROOT / "data").exists():
 UPLOAD_DIR = PROJECT_ROOT / "data" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-def get_card_detector() -> CardDetector:
-    """Initializes and returns the singleton CardDetector instance."""
-    global _card_detector
-    if _card_detector is None:
-        cfg = _load_config()
-        obb_inf = cfg.get("obb", {}).get("inference", {})
-        conf = float(obb_inf.get("conf", 0.18))
-        iou = float(obb_inf.get("iou", 0.45))
-        max_det = int(obb_inf.get("max_det", 10))
-        _card_detector = CardDetector(conf=conf, iou=iou, max_det=max_det)
-    return _card_detector
 
-from backend.experiment import load_config as _load_config
+def get_selected_backend(backend: Optional[str] = None) -> str:
+    """Resolve active detector backend name from query override or YAML config."""
+    cfg = _load_config()
+    return backend or str(cfg.get("detector", {}).get("backend", "obb_pbl"))
+
+
+def get_card_detector(backend: Optional[str] = None):
+    """Initialize and cache singleton detector instance per backend strategy."""
+    selected = get_selected_backend(backend)
+    if selected not in _card_detectors:
+        _card_detectors[selected] = build_card_detector(backend=selected)
+    return _card_detectors[selected]
 
 _quick_reject = QuickRejectRaw()
 _quality_gate = ImageQualityGate()
@@ -100,7 +102,11 @@ async def root():
 async def get_status():
     """Returns current operational status of the inspection pipeline and models."""
     status = dict(detector.status)
-    status["obb_weights"] = _card_detector.weights_path if _card_detector else None
+    selected_backend = get_selected_backend()
+    active_cd = _card_detectors.get(selected_backend)
+    status["detector_backend"] = selected_backend
+    status["available_backends"] = ["obb_pbl", "seg_yolo", "seg_zeroshot", "seg_semantic"]
+    status["obb_weights"] = getattr(active_cd, "weights_path", None) if active_cd else None
     status["active_reference"] = _manual_reference_info
     status["quality_gate"] = {
         "quick_reject": {
@@ -245,8 +251,11 @@ async def get_reference_image(card_id: str):
     raise HTTPException(status_code=404, detail="Reference image not found")
 
 @app.post("/detect", tags=["Pipeline"])
-async def detect_cards(file: UploadFile = File(..., description="Scene photograph containing cards")):
-    """Detects oriented cards in a raw scene photograph using YOLO11s-OBB."""
+async def detect_cards(
+    file: UploadFile = File(..., description="Scene photograph containing cards"),
+    backend: Optional[str] = Query(None, description="Detector backend: obb_pbl | seg_yolo | seg_zeroshot | seg_semantic"),
+):
+    """Detects oriented cards in a raw scene photograph using the selected backend."""
     tmp_path = UPLOAD_DIR / f"scene_{file.filename or 'scene.jpg'}"
     try:
         with open(tmp_path, "wb") as f:
@@ -255,8 +264,11 @@ async def detect_cards(file: UploadFile = File(..., description="Scene photograp
         if img is None:
             raise HTTPException(status_code=400, detail="Unreadable image file.")
 
-        cd = get_card_detector()
+        selected_backend = get_selected_backend(backend)
+        cd = get_card_detector(selected_backend)
+        t0 = time.perf_counter()
         dets = cd.detect(img)
+        detect_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         from backend.detector import ndarray_to_base64
 
         warning_msg = None
@@ -273,10 +285,18 @@ async def detect_cards(file: UploadFile = File(..., description="Scene photograp
                 "confidence": d.confidence,
                 "corners": d.corners.tolist(),
                 "sharpness": d.patch_gray_score,
+                "has_dynamic_mask": d.mask is not None,
                 "patch_b64": ndarray_to_base64(d.patch),
             })
         scene_b64 = ndarray_to_base64(cd.draw_detections(img, dets)) if dets else None
-        return {"n_cards": len(out), "detections": out, "scene_b64": scene_b64, "warning": warning_msg}
+        return {
+            "n_cards": len(out),
+            "detector_backend": selected_backend,
+            "detect_ms": detect_ms,
+            "detections": out,
+            "scene_b64": scene_b64,
+            "warning": warning_msg,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -292,6 +312,7 @@ async def analyze_card(
     dead_zone: Optional[float] = Query(None, ge=0.0, le=1.0, description="Dead zone noise threshold (0.0 - 1.0)"),
     gamma: Optional[float] = Query(None, ge=0.1, le=5.0, description="Gamma correction exponent (e.g. 2.0)"),
     few_shot: Optional[bool] = Query(True, description="Use Few-Shot (photometric variants) or One-Shot (single scan)"),
+    backend: Optional[str] = Query(None, description="Detector backend: obb_pbl | seg_yolo | seg_zeroshot | seg_semantic"),
 ):
     """Executes the full card condition grading pipeline."""
     if not detector.memory_bank_ready or not _manual_reference_info:
@@ -302,6 +323,7 @@ async def analyze_card(
 
     tmp_path = UPLOAD_DIR / f"test_{file.filename or 'card.jpg'}"
     try:
+        t_start = time.perf_counter()
         with open(tmp_path, "wb") as f:
             f.write(await file.read())
         img = cv2.imread(str(tmp_path), cv2.IMREAD_COLOR)
@@ -315,8 +337,11 @@ async def analyze_card(
                 detail=reason,
             )
 
-        cd = get_card_detector()
+        selected_backend = get_selected_backend(backend)
+        cd = get_card_detector(selected_backend)
+        t_det0 = time.perf_counter()
         dets = cd.detect(img)
+        detect_ms = round((time.perf_counter() - t_det0) * 1000.0, 2)
         if not dets:
             raise HTTPException(
                 status_code=422,
@@ -344,12 +369,14 @@ async def analyze_card(
             sides.append(np.linalg.norm(p2 - p1))
         sides.sort()
         box_aspect_ratio = sides[0] / sides[3] if sides[3] > 0 else 1.0
-        
+
+        det_patch_bgr = cv2.cvtColor(det.patch, cv2.COLOR_RGB2BGR)
         quality_result = _quality_gate.evaluate(
-            image=det.patch,
+            image=det_patch_bgr,
             detection_confidence=det.confidence,
             box_aspect_ratio=box_aspect_ratio,
             box_area_ratio=box_area_ratio,
+            valid_mask=det.mask,
         )
 
         quality_summary = {
@@ -378,10 +405,27 @@ async def analyze_card(
                 detail=f"Image quality insufficient: {reject_details}",
             )
 
-        result = detector.analyze_patch(det.patch, dead_zone=dead_zone, gamma=gamma, use_few_shot=few_shot)
+        t_an0 = time.perf_counter()
+        result = detector.analyze_patch(
+            det.patch,
+            dead_zone=dead_zone,
+            gamma=gamma,
+            use_few_shot=few_shot,
+            query_mask=det.mask,
+        )
+        analyze_ms = round((time.perf_counter() - t_an0) * 1000.0, 2)
+        total_ms = round((time.perf_counter() - t_start) * 1000.0, 2)
         result["detection"] = {
             "confidence": det.confidence,
             "corners": det.corners.tolist(),
+            "backend": selected_backend,
+            "dynamic_mask": det.mask is not None,
+        }
+        result["detector_backend"] = selected_backend
+        result["timing_ms"] = {
+            "detect": detect_ms,
+            "analyze": analyze_ms,
+            "total": total_ms,
         }
         result["quality"] = quality_summary
         result["reference"] = _manual_reference_info
@@ -390,9 +434,9 @@ async def analyze_card(
         result["n_cards_detected"] = len(dets)
 
         logger.info(
-            f"Baseline inspection complete: card={_manual_reference_info['name']}, "
+            f"Inspection complete [{selected_backend}]: card={_manual_reference_info['name']}, "
             f"score={result['score']:.4f}, condition={result['condition']['label']}, "
-            f"quality={quality_result.score:.2f}"
+            f"quality={quality_result.score:.2f}, detect={detect_ms:.1f}ms"
         )
         return JSONResponse(content=result)
 

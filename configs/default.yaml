@@ -16,6 +16,56 @@ paths:
   report_dir: report
 
 # -- Modulo 1: Rilevamento della carta (YOLO OBB) -----------------------------
+# -- Modulo 1: Rilevamento della carta (YOLO OBB) -----------------------------
+detector:
+  backend: obb_pbl              # obb_pbl | seg_yolo | seg_zeroshot | seg_semantic
+  rectifier:
+    edge_fit_method: ransac     # ransac | huber
+    corner_excl_frac: 0.14      # Fraction trimmed at each end of an edge to exclude rounded corners
+    min_side_inliers: 12
+    ransac_thresh_px: 2.5
+    ransac_iters: 120
+    erode_mask_px: 2            # Slight inward erosion of warped mask to suppress border bleed
+    feather_px: 3
+    refine_edges: true          # Snap segmentation borders to full-res Sobel + Lab gradients
+
+segmentation:
+  dataset:
+    name: pokemon_seg
+    imgsz: 640
+    split: [0.70, 0.15, 0.15]
+    hard_negative_ratio: 0.06
+    perspective_prob: 0.70
+    perspective_max_tilt: 0.18
+    occlusion_prob: 0.35
+    sleeve_prob: 0.25
+    full_art_prob: 0.25
+    tight_framing_prob: 0.25
+    corner_radius_frac: 0.045
+  yolo_seg:
+    weights: data/weights/yolo11s_seg_best.pt
+    weights_960: data/weights/yolo11s_seg_960_best.pt
+    base_model: yolo11s-seg.pt
+    imgsz: 640
+    conf: 0.25
+    iou: 0.45
+    max_det: 10
+    retina_masks: true
+    crop_refine: true           # Two-stage padded ROI crop + re-inference for sharper edges
+  zeroshot:
+    engine: yoloe               # yoloe | fastsam | sam2
+    model: yoloe-11s-seg.pt
+    fastsam_model: FastSAM-s.pt
+    text_prompts: ["trading card", "pokemon card", "playing card"]
+    imgsz: 640
+    conf: 0.15
+  semantic:
+    arch: unet_mobilenetv3
+    weights: data/weights/seg_semantic_best.pt
+    imgsz: 640
+    threshold: 0.50
+    min_area_frac: 0.04
+
 obb:
   dataset:
     name: pokemon_obb

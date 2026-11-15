@@ -27,6 +27,7 @@ class CardDetection:
     confidence: float
     patch: np.ndarray
     patch_gray_score: float
+    mask: Optional[np.ndarray] = None
 
 class CardDetector:
     """YOLO OBB-based Pokémon card detector with perspective-warp cropping."""
@@ -681,3 +682,24 @@ class CardDetector:
             cv2.putText(vis, f"{d.confidence:.2f}", (cx - 20, cy - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         return vis
+
+
+def build_card_detector(backend: Optional[str] = None, **kwargs):
+    """Instantiate the configured card localization or segmentation backend."""
+    from backend.experiment import load_config
+
+    cfg = load_config()
+    selected = backend or cfg.get("detector", {}).get("backend", "obb_pbl")
+    if selected == "obb_pbl":
+        obb_inf = cfg.get("obb", {}).get("inference", {})
+        return CardDetector(
+            conf=float(kwargs.get("conf", obb_inf.get("conf", 0.12))),
+            iou=float(kwargs.get("iou", obb_inf.get("iou", 0.45))),
+            max_det=int(kwargs.get("max_det", obb_inf.get("max_det", 10))),
+            weights_path=kwargs.get("weights_path"),
+        )
+    if selected in ("seg_yolo", "seg_zeroshot", "seg_semantic"):
+        from backend.seg_detector import SegmentationCardDetector
+
+        return SegmentationCardDetector(backend=selected, **kwargs)
+    raise ValueError(f"Unknown detector backend: {selected}")

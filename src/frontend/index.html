@@ -1187,9 +1187,18 @@
           <span style="font-size: 0.8rem; color: var(--text-muted);" id="statusHint">
             Select reference in Step 1 and upload card photo in Step 2 to analyze.
           </span>
-          <button class="btn btn-primary" id="analyzeBtn" onclick="runAnalysis()" disabled>
-            Analyze Card
-          </button>
+          <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+            <select id="detectorBackendSelect" title="Detector / Segmentation Backend"
+              style="background: var(--bg-surface); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 9px 12px; font-size: 0.82rem; font-family: inherit;">
+              <option value="obb_pbl">Baseline: YOLO11s-OBB + PBL</option>
+              <option value="seg_yolo">Seg: YOLO11s-Seg</option>
+              <option value="seg_zeroshot">Seg: Zero-Shot (YOLOE)</option>
+              <option value="seg_semantic">Seg: MobileNetV3-UNet (640px)</option>
+            </select>
+            <button class="btn btn-primary" id="analyzeBtn" onclick="runAnalysis()" disabled>
+              Analyze Card
+            </button>
+          </div>
         </div>
       </section>
 
@@ -1402,6 +1411,10 @@
         if (data.few_shot !== undefined) {
           currentFewShot = data.few_shot;
           updateModeBadge(currentFewShot);
+        }
+        if (data.detector_backend) {
+          const backendSel = document.getElementById('detectorBackendSelect');
+          if (backendSel) backendSel.value = data.detector_backend;
         }
         if (data.anomaly_threshold) {
           document.getElementById('thresholdSlider').value = data.anomaly_threshold;
@@ -1648,7 +1661,9 @@
       }, 1200);
 
       try {
-        const res = await fetch(`${API}/analyze?dead_zone=${currentDeadZone}&gamma=${currentGamma}&few_shot=${currentFewShot}`, {
+        const backendSel = document.getElementById('detectorBackendSelect');
+        const backendParam = backendSel ? `&backend=${encodeURIComponent(backendSel.value)}` : '';
+        const res = await fetch(`${API}/analyze?dead_zone=${currentDeadZone}&gamma=${currentGamma}&few_shot=${currentFewShot}${backendParam}`, {
           method: 'POST',
           body: formData,
         });
@@ -1734,6 +1749,10 @@
         }
         if (data.glare_coverage_pct !== undefined && data.glare_coverage_pct > 0) {
           sDetText += ` | Glare: ${data.glare_coverage_pct.toFixed(1)}%`;
+        }
+        if (data.detector_backend) {
+          const detMs = data.timing_ms && data.timing_ms.detect !== undefined ? ` (${data.timing_ms.detect.toFixed(0)} ms)` : '';
+          sDetText += ` | Detector: ${data.detector_backend}${detMs}`;
         }
         sDet.textContent = sDetText;
       }

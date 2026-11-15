@@ -18,6 +18,7 @@ ENV/
 *.pth
 *.bin
 *.onnx
+mobileclip_blt.ts
 
 # Data & Datasets (directory structure preserved via .gitkeep)
 data/datasets/*
@@ -35,7 +36,15 @@ experiments/
 report/
 yolo_runs/
 runs/
+pokedino_trained_outputs*/
+*.zip
 
 # Logs & temporary files
 *.log
 scratch/
+
+# Local AI agent configuration & skills
+.agents/
+AGENTS.md
+.agent.md
+.agents.md
