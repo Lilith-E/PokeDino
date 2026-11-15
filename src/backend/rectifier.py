@@ -19,6 +19,11 @@ TARGET_H = 630
 TARGET_W = 448
 TARGET_AR = 88.0 / 63.0
 
+CANON_W = 544
+CANON_H = 768
+CANON_PAD_X = 48
+CANON_PAD_Y = 69
+
 
 @dataclass
 class RectifiedCard:
@@ -482,6 +487,264 @@ def rectify_from_mask(
 
     return RectifiedCard(
         corners=quad,
+        patch_rgb=patch_rgb,
+        warped_mask=warped_mask,
+        sharpness=sharpness,
+    )
+
+
+def canonical_obb_box(
+    canon_size: tuple[int, int] = (CANON_H, CANON_W),
+    target_size: tuple[int, int] = (TARGET_H, TARGET_W),
+) -> np.ndarray:
+    """Return [TL, TR, BR, BL] coordinates of the centered card inside the canonical crop."""
+    ch, cw = canon_size
+    th, tw = target_size
+    x0 = float((cw - tw) // 2)
+    y0 = float((ch - th) // 2)
+    return np.array(
+        [
+            [x0, y0],
+            [x0 + tw - 1.0, y0],
+            [x0 + tw - 1.0, y0 + th - 1.0],
+            [x0, y0 + th - 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+def warp_to_canonical_obb(
+    img_bgr: np.ndarray,
+    obb_corners: np.ndarray,
+    canon_size: tuple[int, int] = (CANON_H, CANON_W),
+    target_size: tuple[int, int] = (TARGET_H, TARGET_W),
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Warp a BGR scene crop around an Stage-1 OBB proposal into padded canonical view."""
+    q = order_quad(obb_corners).astype(np.float32)
+    dst_box = canonical_obb_box(canon_size=canon_size, target_size=target_size)
+    ch, cw = canon_size
+    M_canon = cv2.getPerspectiveTransform(q, dst_box)
+    M_canon_inv = np.linalg.inv(M_canon).astype(np.float64)
+    canon_bgr = cv2.warpPerspective(
+        img_bgr,
+        M_canon,
+        (cw, ch),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return canon_bgr, M_canon.astype(np.float64), M_canon_inv
+
+
+def _sample_corridor_side(
+    prob: np.ndarray,
+    side: str,
+    nom_box: np.ndarray,
+    corridor_px: int = 28,
+    corner_excl_frac: float = 0.14,
+) -> np.ndarray:
+    """Locate outer-to-inner 0.5-isosurface card border points strictly inside an OBB corridor."""
+    ch, cw = prob.shape[:2]
+    x0, y0 = float(nom_box[0, 0]), float(nom_box[0, 1])
+    x1, y1 = float(nom_box[2, 0]), float(nom_box[2, 1])
+    tw = x1 - x0
+    th = y1 - y0
+    pts: list[list[float]] = []
+
+    def _find_crossing(line_vals: np.ndarray, coords: np.ndarray) -> Optional[float]:
+        # Walk from outside the card inward so internal artwork/foil holes cannot steal the edge.
+        n_v = len(line_vals)
+        for idx in range(1, n_v - 6):
+            if line_vals[idx - 1] < 0.5 <= line_vals[idx]:
+                # Require solid card interior behind the crossing to reject isolated glare speckles
+                if float(np.mean(line_vals[idx : idx + 7])) >= 0.58:
+                    denom = max(float(line_vals[idx] - line_vals[idx - 1]), 1e-5)
+                    frac = (0.5 - float(line_vals[idx - 1])) / denom
+                    return float(coords[idx - 1] + frac * (coords[idx] - coords[idx - 1]))
+        return None
+
+    if side in ("top", "bottom"):
+        xs = np.arange(
+            int(round(x0 + corner_excl_frac * tw)),
+            int(round(x1 - corner_excl_frac * tw)) + 1,
+            2,
+        )
+        nom_y = int(round(y0 if side == "top" else y1))
+        for x in xs:
+            if not (0 <= x < cw):
+                continue
+            if side == "top":
+                ya = max(0, nom_y - corridor_px)
+                yb = min(ch - 1, nom_y + corridor_px)
+                ys = np.arange(ya, yb + 1, dtype=np.float64)
+            else:
+                ya = min(ch - 1, nom_y + corridor_px)
+                yb = max(0, nom_y - corridor_px)
+                ys = np.arange(ya, yb - 1, -1, dtype=np.float64)
+            if len(ys) < 10:
+                continue
+            vals = prob[ys.astype(np.int32), x]
+            c = _find_crossing(vals, ys)
+            if c is not None:
+                pts.append([float(x), c])
+    else:
+        ys = np.arange(
+            int(round(y0 + corner_excl_frac * th)),
+            int(round(y1 - corner_excl_frac * th)) + 1,
+            2,
+        )
+        nom_x = int(round(x0 if side == "left" else x1))
+        for y in ys:
+            if not (0 <= y < ch):
+                continue
+            if side == "left":
+                xa = max(0, nom_x - corridor_px)
+                xb = min(cw - 1, nom_x + corridor_px)
+                xs_ray = np.arange(xa, xb + 1, dtype=np.float64)
+            else:
+                xa = min(cw - 1, nom_x + corridor_px)
+                xb = max(0, nom_x - corridor_px)
+                xs_ray = np.arange(xa, xb - 1, -1, dtype=np.float64)
+            if len(xs_ray) < 10:
+                continue
+            vals = prob[y, xs_ray.astype(np.int32)]
+            c = _find_crossing(vals, xs_ray)
+            if c is not None:
+                pts.append([c, float(y)])
+
+    return np.asarray(pts, dtype=np.float64) if pts else np.empty((0, 2), dtype=np.float64)
+
+
+def fit_quad_from_canonical_prob(
+    prob_canon: np.ndarray,
+    nom_box: Optional[np.ndarray] = None,
+    corridor_px: int = 28,
+    corner_excl_frac: float = 0.14,
+    min_side_inliers: int = 16,
+    ransac_thresh_px: float = 1.6,
+    ransac_iters: int = 120,
+    max_tilt_rad: float = 0.24,
+) -> np.ndarray:
+    """Fit exact canonical quadrilateral corners constrained inside the OBB corridor."""
+    ch, cw = prob_canon.shape[:2]
+    box = canonical_obb_box(canon_size=(ch, cw)) if nom_box is None else nom_box.astype(np.float64)
+    x0, y0 = float(box[0, 0]), float(box[0, 1])
+    x1, y1 = float(box[2, 0]), float(box[2, 1])
+
+    def _fit_side(side: str, axis: str, default_pos: float) -> tuple[float, float, float]:
+        pts = _sample_corridor_side(
+            prob_canon,
+            side=side,
+            nom_box=box,
+            corridor_px=corridor_px,
+            corner_excl_frac=corner_excl_frac,
+        )
+        fallback = (0.0, 1.0, -default_pos) if axis == "h" else (1.0, 0.0, -default_pos)
+        if len(pts) < min_side_inliers:
+            return fallback
+        line = _fit_line_ransac(pts, thresh_px=ransac_thresh_px, n_iters=ransac_iters)
+        if line is None:
+            return fallback
+        a, b, _ = line
+        if axis == "h" and abs(a) > max_tilt_rad:
+            return fallback
+        if axis == "v" and abs(b) > max_tilt_rad:
+            return fallback
+        return line
+
+    l_top = _fit_side("top", "h", y0)
+    l_right = _fit_side("right", "v", x1)
+    l_bot = _fit_side("bottom", "h", y1)
+    l_left = _fit_side("left", "v", x0)
+
+    pts_out = []
+    for l1, l2 in ((l_top, l_left), (l_top, l_right), (l_bot, l_right), (l_bot, l_left)):
+        pt = _intersect_lines(l1, l2)
+        if pt is None or not np.isfinite(pt).all():
+            return box.astype(np.float64)
+        pts_out.append(pt)
+
+    quad = np.asarray(pts_out, dtype=np.float64)
+    rect = cv2.minAreaRect(quad.astype(np.float32))
+    rw, rh = rect[1]
+    if min(rw, rh) < 40.0:
+        return box.astype(np.float64)
+    ar = max(rw, rh) / max(min(rw, rh), 1e-3)
+    if not (1.15 <= ar <= 1.65):
+        return box.astype(np.float64)
+
+    nom_area = (x1 - x0) * (y1 - y0)
+    ref_area = float(cv2.contourArea(quad.astype(np.float32)))
+    if not (0.60 * nom_area <= ref_area <= 1.40 * nom_area):
+        return box.astype(np.float64)
+    return quad
+
+
+def rectify_from_canonical_prob(
+    img_bgr: np.ndarray,
+    obb_corners: np.ndarray,
+    prob_canon: np.ndarray,
+    M_canon_inv: np.ndarray,
+    target_size: tuple[int, int] = (TARGET_H, TARGET_W),
+    corridor_px: int = 28,
+    corner_excl_frac: float = 0.14,
+    erode_mask_px: int = 2,
+    feather_px: int = 3,
+) -> Optional[RectifiedCard]:
+    """Refine OBB corners via canonical boundary probabilities and extract clean patch + mask."""
+    ch, cw = prob_canon.shape[:2]
+    nom_box = canonical_obb_box(canon_size=(ch, cw), target_size=target_size)
+    quad_canon = fit_quad_from_canonical_prob(
+        prob_canon,
+        nom_box=nom_box,
+        corridor_px=corridor_px,
+        corner_excl_frac=corner_excl_frac,
+    )
+
+    quad_scene = cv2.perspectiveTransform(
+        quad_canon.astype(np.float32).reshape(1, 4, 2),
+        M_canon_inv.astype(np.float32),
+    ).reshape(4, 2).astype(np.float64)
+    quad_scene = order_quad(quad_scene)
+
+    rect = cv2.minAreaRect(quad_scene.astype(np.float32))
+    rw, rh = rect[1]
+    ar = max(rw, rh) / max(min(rw, rh), 1e-3)
+    if not (1.15 <= ar <= 1.65):
+        return None
+
+    target_h, target_w = target_size
+    dst = np.array(
+        [[0, 0], [target_w - 1, 0], [target_w - 1, target_h - 1], [0, target_h - 1]],
+        dtype=np.float32,
+    )
+    M_scene = cv2.getPerspectiveTransform(quad_scene.astype(np.float32), dst)
+    warped_bgr = cv2.warpPerspective(img_bgr, M_scene, (target_w, target_h), flags=cv2.INTER_LANCZOS4)
+    if warped_bgr is None or warped_bgr.mean() < 1.0:
+        return None
+
+    M_mask = cv2.getPerspectiveTransform(quad_canon.astype(np.float32), dst)
+    warped_mask = cv2.warpPerspective(
+        np.clip(prob_canon, 0.0, 1.0).astype(np.float32),
+        M_mask,
+        (target_w, target_h),
+        flags=cv2.INTER_LINEAR,
+    )
+    warped_mask = (warped_mask >= 0.5).astype(np.float32)
+
+    if erode_mask_px > 0:
+        k = erode_mask_px * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        warped_mask = cv2.erode(warped_mask, kernel)
+    if feather_px > 0:
+        warped_mask = cv2.GaussianBlur(warped_mask, (0, 0), float(feather_px))
+    warped_mask = np.clip(warped_mask, 0.0, 1.0).astype(np.float32)
+
+    patch_rgb = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2RGB)
+    gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    return RectifiedCard(
+        corners=quad_scene,
         patch_rgb=patch_rgb,
         warped_mask=warped_mask,
         sharpness=sharpness,

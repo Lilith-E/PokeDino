@@ -44,6 +44,8 @@ def main() -> int:
         backends_to_test.append("seg_yolo")
     if (PROJECT_ROOT / "data" / "weights" / "seg_semantic_best.pt").exists():
         backends_to_test.append("seg_semantic")
+    if (PROJECT_ROOT / "data" / "weights" / "seg_canonical_unet_best.pt").exists():
+        backends_to_test.append("obb_unet")
 
     summary = []
     for bk in backends_to_test:

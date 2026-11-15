@@ -77,6 +77,7 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--out-name", type=str, default=None)
     args = parser.parse_args()
 
     cfg = load_config()
@@ -170,7 +171,8 @@ def main() -> None:
         shutil.copy2(data_file, exp.artifacts_dir / f"yolo_{data_file.name}")
 
     best_pt = run_dir / "weights" / "best.pt"
-    out_weights = PROJECT_ROOT / "data" / "weights" / "yolo11s_obb_paired_best.pt"
+    default_out = "yolo11m_obb_paired_best.pt" if "yolo11m" in args.base_model.lower() else "yolo11s_obb_paired_best.pt"
+    out_weights = PROJECT_ROOT / "data" / "weights" / (args.out_name or default_out)
     if best_pt.exists():
         out_weights.parent.mkdir(parents=True, exist_ok=True)
         out_weights.write_bytes(best_pt.read_bytes())

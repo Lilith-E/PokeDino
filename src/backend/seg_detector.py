@@ -15,15 +15,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from backend.card_detector import CardDetection, TARGET_H, TARGET_W
+from backend.card_detector import CardDetection, CardDetector, TARGET_H, TARGET_W
 from backend.experiment import get_device, load_config
-from backend.rectifier import rectify_from_mask
+from backend.rectifier import (
+    CANON_H,
+    CANON_W,
+    rectify_from_canonical_prob,
+    rectify_from_mask,
+    warp_to_canonical_obb,
+)
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if not (PROJECT_ROOT / "configs").exists():
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def bgr_to_imagenet_tensor(
+    img_bgr: np.ndarray,
+    size_hw: tuple[int, int],
+    device: str | torch.device,
+) -> torch.Tensor:
+    """Resize a BGR image to ``(H, W)`` and normalize with ImageNet channel statistics."""
+    th, tw = size_hw
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    if rgb.shape[:2] != (th, tw):
+        rgb = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_LINEAR)
+    tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0)
+    mean = torch.tensor(_IMAGENET_MEAN).view(3, 1, 1)
+    std = torch.tensor(_IMAGENET_STD).view(3, 1, 1)
+    return ((tensor - mean) / std).unsqueeze(0).to(device)
 
 
 class _ConvBlock(nn.Module):
@@ -348,12 +374,7 @@ class SegmentationCardDetector:
         h_img, w_img = img_bgr.shape[:2]
         img_area = float(h_img * w_img)
 
-        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
-        tensor = torch.from_numpy(resized).permute(2, 0, 1).float().div(255.0)
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        tensor = ((tensor - mean) / std).unsqueeze(0).to(self.device)
+        tensor = bgr_to_imagenet_tensor(img_bgr, (self.imgsz, self.imgsz), self.device)
 
         with torch.inference_mode():
             logits = self.model(tensor)
@@ -411,3 +432,140 @@ class SegmentationCardDetector:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2,
             )
         return vis
+
+
+class OBBCanonicalUNetDetector:
+    """Two-stage detector: Stage 1 Heavy YOLO-OBB -> Stage 2 Canonical Boundary UNet."""
+
+    def __init__(
+        self,
+        obb_weights: Optional[str] = None,
+        unet_weights: Optional[str] = None,
+        conf: Optional[float] = None,
+        iou: Optional[float] = None,
+        max_det: Optional[int] = None,
+        adaptive_tta: Optional[bool] = None,
+        adaptive_tta_conf: Optional[float] = None,
+        corridor_px: Optional[int] = None,
+        canon_size: tuple[int, int] = (CANON_H, CANON_W),
+        target_size: tuple[int, int] = (TARGET_H, TARGET_W),
+        device: Optional[str] = None,
+    ):
+        cfg = load_config()
+        ou_cfg = cfg.get("detector", {}).get("obb_unet", {})
+        obb_inf = cfg.get("obb", {}).get("inference", {})
+        rect_cfg = cfg.get("detector", {}).get("rectifier", {})
+
+        self.device = device or get_device(cfg)
+        self.canon_h, self.canon_w = canon_size
+        self.target_size = target_size
+        self.corridor_px = int(ou_cfg.get("corridor_px", 28) if corridor_px is None else corridor_px)
+        self.corner_excl_frac = float(rect_cfg.get("corner_excl_frac", 0.14))
+        self.erode_mask_px = int(rect_cfg.get("erode_mask_px", 2))
+        self.feather_px = int(rect_cfg.get("feather_px", 3))
+
+        resolved_obb = self._resolve_obb_weights(obb_weights, ou_cfg)
+        self.obb_detector = CardDetector(
+            weights_path=resolved_obb,
+            conf=float(obb_inf.get("conf", 0.12) if conf is None else conf),
+            iou=float(obb_inf.get("iou", 0.45) if iou is None else iou),
+            max_det=int(obb_inf.get("max_det", 10) if max_det is None else max_det),
+            adaptive_tta=bool(ou_cfg.get("adaptive_tta", True) if adaptive_tta is None else adaptive_tta),
+            adaptive_tta_conf=float(
+                ou_cfg.get("adaptive_tta_conf", 0.75) if adaptive_tta_conf is None else adaptive_tta_conf
+            ),
+            use_pbl=False,
+        )
+
+        w_unet = Path(unet_weights or ou_cfg.get("unet_weights", "data/weights/seg_canonical_unet_best.pt"))
+        if not w_unet.is_absolute():
+            w_unet = PROJECT_ROOT / w_unet
+        if not w_unet.exists():
+            raise FileNotFoundError(
+                f"Canonical Boundary UNet weights missing at {w_unet}. "
+                "Run scripts/train_canonical_refiner.py first."
+            )
+
+        self.unet_weights_path = str(w_unet)
+        self.weights_path = f"{Path(resolved_obb).name} + {w_unet.name}"
+        logger.info("Loading Canonical Boundary UNet from %s", self.unet_weights_path)
+        net = MobileNetV3UNet(pretrained=False)
+        ckpt = torch.load(self.unet_weights_path, map_location=self.device, weights_only=True)
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        net.load_state_dict(state)
+        net.to(self.device).eval()
+        self.refiner = net
+
+    @staticmethod
+    def _resolve_obb_weights(explicit: Optional[str], ou_cfg: dict) -> str:
+        candidates = [
+            explicit,
+            ou_cfg.get("obb_weights"),
+            "data/weights/yolo11m_obb_paired_best.pt",
+            "data/weights/yolo11s_obb_paired_best.pt",
+            "data/weights/yolo11s_obb_finetuned_best.pt",
+        ]
+        for cand in candidates:
+            if not cand:
+                continue
+            p = Path(cand)
+            if not p.is_absolute():
+                p = PROJECT_ROOT / p
+            if p.exists():
+                return str(p)
+        raise FileNotFoundError("No YOLO-OBB weights found for OBBCanonicalUNetDetector.")
+
+    def detect(self, img_bgr) -> list[CardDetection]:
+        """Run Stage-1 OBB proposals then Stage-2 Canonical UNet border refinement."""
+        if isinstance(img_bgr, (str, Path)):
+            img_bgr = cv2.imread(str(img_bgr))
+            if img_bgr is None:
+                return []
+
+        proposals = self.obb_detector.propose_quads(img_bgr)
+        detections: list[CardDetection] = []
+        for prop in proposals:
+            canon_bgr, _, M_canon_inv = warp_to_canonical_obb(
+                img_bgr,
+                prop["corners"],
+                canon_size=(self.canon_h, self.canon_w),
+                target_size=self.target_size,
+            )
+            tensor = bgr_to_imagenet_tensor(canon_bgr, (self.canon_h, self.canon_w), self.device)
+            with torch.inference_mode():
+                logits = self.refiner(tensor)
+                prob_canon = torch.sigmoid(logits)[0, 0].cpu().numpy()
+
+            res = rectify_from_canonical_prob(
+                img_bgr=img_bgr,
+                obb_corners=prop["corners"],
+                prob_canon=prob_canon,
+                M_canon_inv=M_canon_inv,
+                target_size=self.target_size,
+                corridor_px=self.corridor_px,
+                corner_excl_frac=self.corner_excl_frac,
+                erode_mask_px=self.erode_mask_px,
+                feather_px=self.feather_px,
+            )
+            if res is None:
+                continue
+            detections.append(
+                CardDetection(
+                    corners=res.corners,
+                    confidence=float(prop["conf"]),
+                    patch=res.patch_rgb,
+                    patch_gray_score=res.sharpness,
+                    mask=res.warped_mask,
+                )
+            )
+        return detections
+
+    def detect_first(self, img_bgr: np.ndarray) -> Optional[CardDetection]:
+        """Return highest-confidence detection or None."""
+        dets = self.detect(img_bgr)
+        return dets[0] if dets else None
+
+    @staticmethod
+    def draw_detections(img_bgr: np.ndarray, detections: list[CardDetection]) -> np.ndarray:
+        """Draw refined quad contours on an RGB copy of the scene."""
+        return SegmentationCardDetector.draw_detections(img_bgr, detections)

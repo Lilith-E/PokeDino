@@ -42,6 +42,9 @@ class CardDetector:
         imgsz: int = 640,
         corner_shrink: float = 0.0,
         refine: bool = False,
+        adaptive_tta: bool = False,
+        adaptive_tta_conf: float = 0.75,
+        use_pbl: bool = True,
     ):
         from ultralytics import YOLO
 
@@ -51,6 +54,9 @@ class CardDetector:
         self.imgsz = imgsz
         self.corner_shrink = corner_shrink
         self.refine = refine
+        self.adaptive_tta = adaptive_tta
+        self.adaptive_tta_conf = adaptive_tta_conf
+        self.use_pbl = use_pbl
         self.target_h, self.target_w = target_size
 
         if weights_path is None:
@@ -108,25 +114,13 @@ class CardDetector:
                     best, best_error = candidate, error
         return best, best_error
 
-    def detect(self, img_bgr) -> list[CardDetection]:
-        """
-        Detect cards in a BGR scene (or image file path) and return warped upright patches.
-
-        Returns a list of CardDetection sorted by confidence (descending).
-        Enforces strict full-card geometry: discards partial sub-rectangles or split boxes.
-        """
-        if isinstance(img_bgr, (str, Path)):
-            img_bgr = cv2.imread(str(img_bgr))
-            if img_bgr is None:
-                return []
-
+    def propose_quads(self, img_bgr: np.ndarray) -> list[dict]:
+        """Run OBB detection (adaptive 1-view or 4-view TTA) and cluster quads."""
         h_img, w_img = img_bgr.shape[:2]
         img_area = float(h_img * w_img)
-
-        raw_candidates = []
+        raw_candidates: list[dict] = []
 
         def collect_candidates(view: np.ndarray, rotation: int = 0, offset=(0, 0)):
-            """Runs YOLO-OBB inference on a view and maps candidates back to unrotated coordinates."""
             result = self.model.predict(
                 view, conf=self.conf, iou=self.iou, max_det=self.max_det,
                 imgsz=self.imgsz, verbose=False
@@ -145,29 +139,48 @@ class CardDetector:
                 area_frac = (side_short * side_long) / max(img_area, 1.0)
                 if 1.15 <= ar <= 1.65 and area_frac >= 0.06:
                     score = float(conf) / (1.0 + 3.0 * abs(ar - TARGET_AR))
-                    raw_candidates.append({"corners": corners, "conf": float(conf), "ar": ar, "score": score})
+                    raw_candidates.append({
+                        "corners": corners,
+                        "conf": float(conf),
+                        "ar": ar,
+                        "area_frac": area_frac,
+                        "score": score,
+                    })
 
-        for rotation in range(4):
-            view = np.ascontiguousarray(np.rot90(img_bgr, rotation)) if rotation else img_bgr
-            collect_candidates(view, rotation)
-
+        collect_candidates(img_bgr, 0)
         needs_context = not raw_candidates
         for cand in raw_candidates:
             q = cand["corners"]
-            edge_margin = min(float(q[:, 0].min()), float(q[:, 1].min()),
-                              float(w_img - 1 - q[:, 0].max()), float(h_img - 1 - q[:, 1].max()))
-            rect = cv2.minAreaRect(q.astype(np.float32))
-            area_frac = rect[1][0] * rect[1][1] / max(img_area, 1.0)
-            if edge_margin < 12.0 or area_frac > 0.55:
+            edge_margin = min(
+                float(q[:, 0].min()), float(q[:, 1].min()),
+                float(w_img - 1 - q[:, 0].max()), float(h_img - 1 - q[:, 1].max()),
+            )
+            if edge_margin < 12.0 or cand["area_frac"] > 0.55:
                 needs_context = True
                 break
+
         if needs_context:
-            for rotation in range(4):
-                view = np.ascontiguousarray(np.rot90(img_bgr, rotation)) if rotation else img_bgr
-                view_h, view_w = view.shape[:2]
-                pad_h, pad_w = int(view_h * 0.08), int(view_w * 0.08)
-                padded = cv2.copyMakeBorder(view, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_REPLICATE)
-                collect_candidates(padded, rotation, (pad_w, pad_h))
+            pad_h, pad_w = int(h_img * 0.08), int(w_img * 0.08)
+            padded0 = cv2.copyMakeBorder(img_bgr, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_REPLICATE)
+            collect_candidates(padded0, 0, (pad_w, pad_h))
+
+        best_single = max(raw_candidates, key=lambda c: c["score"], default=None)
+        skip_rotations = (
+            self.adaptive_tta
+            and best_single is not None
+            and best_single["conf"] >= self.adaptive_tta_conf
+            and abs(best_single["ar"] - TARGET_AR) <= 0.14
+        )
+
+        if not skip_rotations:
+            for rotation in (1, 2, 3):
+                view = np.ascontiguousarray(np.rot90(img_bgr, rotation))
+                collect_candidates(view, rotation)
+                if needs_context:
+                    vh, vw = view.shape[:2]
+                    ph, pw = int(vh * 0.08), int(vw * 0.08)
+                    padded = cv2.copyMakeBorder(view, ph, ph, pw, pw, cv2.BORDER_REPLICATE)
+                    collect_candidates(padded, rotation, (pw, ph))
 
         raw_candidates.sort(key=lambda x: x["score"], reverse=True)
         clusters = []
@@ -206,8 +219,16 @@ class CardDetector:
             score = conf / (1.0 + 3.0 * abs(ar - TARGET_AR))
             kept_candidates.append({"corners": fused, "conf": conf, "ar": ar, "score": score})
         kept_candidates.sort(key=lambda x: x["score"], reverse=True)
-        kept_candidates = kept_candidates[:self.max_det]
+        return kept_candidates[:self.max_det]
 
+    def detect(self, img_bgr) -> list[CardDetection]:
+        """Detect cards in a BGR scene and return warped upright patches."""
+        if isinstance(img_bgr, (str, Path)):
+            img_bgr = cv2.imread(str(img_bgr))
+            if img_bgr is None:
+                return []
+
+        kept_candidates = self.propose_quads(img_bgr)
         detections: list[CardDetection] = []
         for cand in kept_candidates:
             corners = cand["corners"]
@@ -216,7 +237,8 @@ class CardDetector:
                 ctr = corners.mean(axis=0)
                 corners = ctr + (corners - ctr) * (1.0 - self.corner_shrink)
 
-            corners = self._lock_physical_card(img_bgr, corners)
+            if self.use_pbl:
+                corners = self._lock_physical_card(img_bgr, corners)
 
             if self.refine:
                 patch, corners = self._refine_warp(img_bgr, corners)
@@ -698,6 +720,10 @@ def build_card_detector(backend: Optional[str] = None, **kwargs):
             max_det=int(kwargs.get("max_det", obb_inf.get("max_det", 10))),
             weights_path=kwargs.get("weights_path"),
         )
+    if selected == "obb_unet":
+        from backend.seg_detector import OBBCanonicalUNetDetector
+
+        return OBBCanonicalUNetDetector(**kwargs)
     if selected in ("seg_yolo", "seg_zeroshot", "seg_semantic"):
         from backend.seg_detector import SegmentationCardDetector
 

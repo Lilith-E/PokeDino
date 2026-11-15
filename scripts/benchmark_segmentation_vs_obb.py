@@ -26,7 +26,7 @@ for p in (PROJECT_ROOT / "src", PROJECT_ROOT):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from backend.card_detector import CardDetector, TARGET_H, TARGET_W  # noqa: E402
+from backend.card_detector import CardDetector, TARGET_H, TARGET_W, build_card_detector  # noqa: E402
 from backend.detector import PokemonAnomalyDetector  # noqa: E402
 from backend.experiment import Experiment, load_config, set_seed  # noqa: E402
 from backend.masking import rounded_rect_mask  # noqa: E402
@@ -137,6 +137,12 @@ def _build_backends(cfg: dict) -> dict[str, object]:
         backends["seg_semantic"] = SegmentationCardDetector(
             backend="seg_semantic", weights_path=str(wsem), imgsz=640
         )
+
+    wunet = PROJECT_ROOT / cfg.get("detector", {}).get("obb_unet", {}).get(
+        "unet_weights", "data/weights/seg_canonical_unet_best.pt"
+    )
+    if wunet.exists():
+        backends["obb_unet"] = build_card_detector(cfg, backend="obb_unet")
 
     return backends
 

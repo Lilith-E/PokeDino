@@ -18,7 +18,19 @@ paths:
 # -- Modulo 1: Rilevamento della carta (YOLO OBB) -----------------------------
 # -- Modulo 1: Rilevamento della carta (YOLO OBB) -----------------------------
 detector:
-  backend: obb_pbl              # obb_pbl | seg_yolo | seg_zeroshot | seg_semantic
+  backend: obb_pbl              # obb_pbl | obb_unet | seg_yolo | seg_zeroshot | seg_semantic
+  obb_unet:
+    obb_weights: data/weights/yolo11m_obb_paired_best.pt
+    unet_weights: data/weights/seg_canonical_unet_best.pt
+    adaptive_tta: true
+    adaptive_tta_conf: 0.75
+    corridor_px: 28
+    canon_size: [768, 544]      # Divisible by 32; centers (630, 448) at 1:1 resolution with 48/69px pad
+    dataset:
+      name: pokemon_canon_refiner
+      n_train: 3500
+      n_val: 500
+      n_test: 500
   rectifier:
     edge_fit_method: ransac     # ransac | huber
     corner_excl_frac: 0.14      # Fraction trimmed at each end of an edge to exclude rounded corners

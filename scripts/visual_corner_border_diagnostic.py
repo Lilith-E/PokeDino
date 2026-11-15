@@ -9,6 +9,7 @@ smartphone photographs in experiments/synthetic-to-real/, visualizing:
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -25,7 +26,7 @@ for p in (PROJECT_ROOT / "src", PROJECT_ROOT):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from backend.card_detector import CardDetector  # noqa: E402
+from backend.card_detector import CardDetector, build_card_detector  # noqa: E402
 from backend.experiment import load_config  # noqa: E402
 from backend.seg_detector import SegmentationCardDetector  # noqa: E402
 from scripts.benchmark_segmentation_vs_obb import project_patch_mask_to_scene  # noqa: E402
@@ -121,34 +122,45 @@ def _corner_zoom_mosaic(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Visual corner/border diagnostic on real card photos.")
+    parser.add_argument("--only-obb-variants", action="store_true", help="Compare only OBB+PBL vs OBB+Canon UNet.")
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     cfg = load_config()
     real_dir = PROJECT_ROOT / "experiments" / "synthetic-to-real"
     out_dir = PROJECT_ROOT / "report" / "figures" / "05_segmentation_pipeline" / "corner_diagnostics"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    backends = [
+    backends: list[tuple[str, object]] = [
         ("OBB + PBL", CardDetector(
             conf=float(cfg["obb"]["inference"]["conf"]),
             iou=float(cfg["obb"]["inference"]["iou"]),
             max_det=int(cfg["obb"]["inference"]["max_det"]),
         )),
-        ("YOLO11-Seg @ 640", SegmentationCardDetector(
-            backend="seg_yolo",
-            weights_path=str(PROJECT_ROOT / cfg["segmentation"]["yolo_seg"]["weights"]),
-            imgsz=640,
-        )),
-        ("YOLO11-Seg @ 960", SegmentationCardDetector(
-            backend="seg_yolo",
-            weights_path=str(PROJECT_ROOT / cfg["segmentation"]["yolo_seg"]["weights_960"]),
-            imgsz=960,
-        )),
-        ("MobileNetV3-UNet", SegmentationCardDetector(
-            backend="seg_semantic",
-            weights_path=str(PROJECT_ROOT / cfg["segmentation"]["semantic"]["weights"]),
-            imgsz=640,
-        )),
     ]
+    w_unet = PROJECT_ROOT / cfg.get("detector", {}).get("obb_unet", {}).get(
+        "unet_weights", "data/weights/seg_canonical_unet_best.pt"
+    )
+    if w_unet.exists():
+        backends.append(("OBB + Canon UNet", build_card_detector(cfg, backend="obb_unet")))
+
+    if not args.only_obb_variants:
+        w640 = PROJECT_ROOT / cfg["segmentation"]["yolo_seg"]["weights"]
+        if w640.exists():
+            backends.append(("YOLO11-Seg @ 640", SegmentationCardDetector(
+                backend="seg_yolo", weights_path=str(w640), imgsz=640,
+            )))
+        w960 = PROJECT_ROOT / cfg["segmentation"]["yolo_seg"]["weights_960"]
+        if w960.exists():
+            backends.append(("YOLO11-Seg @ 960", SegmentationCardDetector(
+                backend="seg_yolo", weights_path=str(w960), imgsz=960,
+            )))
+        wsem = PROJECT_ROOT / cfg["segmentation"]["semantic"]["weights"]
+        if wsem.exists():
+            backends.append(("MobileNetV3-UNet", SegmentationCardDetector(
+                backend="seg_semantic", weights_path=str(wsem), imgsz=640,
+            )))
 
     for fname in REAL_IMAGES:
         fpath = real_dir / fname
