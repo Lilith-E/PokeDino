@@ -117,9 +117,11 @@ clahe:
 
 # -- Modulo 3: Rilevamento anomalie superficiali (DINOv2) ---------------------
 anomaly:
-  model: dinov2_vitb14
+  model: dinov2_vitb14_reg
   img_size: 448
   target_size: [630, 448]
+  scale_with_resolution: true  # Proportions spatial radius & cluster area to img_size / 448
+  feature_layers: null         # Optional ViT block indices (e.g. [5, 8, 11]); requires recalibrating thresholds if set
   luma_matching: true          # Global exposure matching of the query toward the reference luminance
   orientation_canonicalization: true  # Score 0/90/180/270 orientations, keep the best (rotation-invariant inspection)
   knn_neighbors: 1

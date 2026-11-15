@@ -288,11 +288,13 @@ class PokemonAnomalyDetector:
         spatial_config: Optional[SpatialSearchConfig] = None,
         morphology_config: Optional[MorphologyConfig] = None,
         feature_cache_dir: Optional[str] = None,
+        scale_with_resolution: Optional[bool] = None,
+        feature_layers: Optional[tuple[int, ...] | list[int]] = None,
     ):
         """Inizializza i parametri operativi del detector."""
         self.device = device or get_device()
         self.model_name = model_name
-        self.img_size = img_size
+        self.img_size = int(img_size)
         self.anomaly_threshold = anomaly_threshold
         self.knn_neighbors = knn_neighbors
         self.clahe_enabled = clahe_enabled
@@ -310,8 +312,43 @@ class PokemonAnomalyDetector:
         self.gamma = gamma if gamma is not None else DEFAULT_GAMMA
         self.defect_area_weight = defect_area_weight if defect_area_weight is not None else DEFECT_AREA_WEIGHT
         self.defect_pixel_threshold = defect_pixel_threshold if defect_pixel_threshold is not None else DEFECT_PIXEL_THRESHOLD
-        self.spatial_config = spatial_config or DEFAULT_SPATIAL_CONFIG
-        self.morphology_config = morphology_config or DEFAULT_MORPHOLOGY_CONFIG
+
+        cfg_scale_res = _CFG.get("anomaly", {}).get("scale_with_resolution", True)
+        self.scale_with_resolution = bool(cfg_scale_res if scale_with_resolution is None else scale_with_resolution)
+
+        cfg_layers = _CFG.get("anomaly", {}).get("feature_layers", None)
+        raw_layers = feature_layers if feature_layers is not None else cfg_layers
+        self.feature_layers: Optional[tuple[int, ...]] = tuple(int(x) for x in raw_layers) if raw_layers else None
+
+        res_scale = float(self.img_size) / float(TARGET_SIZE[1])
+        self._res_scale = res_scale
+        self._processing_size = self._compute_processing_size(self.img_size)
+        self._cache_model_tag = (
+            f"{self.model_name}_L{'-'.join(map(str, self.feature_layers))}"
+            if self.feature_layers
+            else self.model_name
+        )
+
+        base_spatial = spatial_config or DEFAULT_SPATIAL_CONFIG
+        base_morph = morphology_config or DEFAULT_MORPHOLOGY_CONFIG
+        if self.scale_with_resolution and abs(res_scale - 1.0) > 1e-4:
+            area_scale = res_scale ** 2
+            self.spatial_config = SpatialSearchConfig(
+                enabled=base_spatial.enabled,
+                radius_patches=round(base_spatial.radius_patches * res_scale, 4),
+                penalty_weight=base_spatial.penalty_weight,
+            )
+            self.morphology_config = MorphologyConfig(
+                enabled=base_morph.enabled,
+                large_cluster_threshold=max(1, int(round(base_morph.large_cluster_threshold * area_scale))),
+                cluster_penalty=base_morph.cluster_penalty / area_scale,
+                linear_eccentricity=base_morph.linear_eccentricity,
+                linear_penalty=base_morph.linear_penalty,
+            )
+        else:
+            self.spatial_config = base_spatial
+            self.morphology_config = base_morph
+
         self.feature_cache_dir = feature_cache_dir or _FEATURE_CACHE_DIR
 
         self.model = None
@@ -344,11 +381,27 @@ class PokemonAnomalyDetector:
         self._last_morphology_bonus: float = 0.0
         self._last_morphology: Optional[MorphologyResult] = None
 
+    @staticmethod
+    def _compute_processing_size(img_size: int) -> tuple[int, int]:
+        """Compute DINOv2-aligned (height, width) preserving card aspect ratio."""
+        base_h, base_w = TARGET_SIZE
+        if img_size == base_w:
+            return base_h, base_w
+        scale = float(img_size) / float(base_w)
+        proc_w = int(round(img_size / 14.0) * 14)
+        proc_h = int(round((base_h * scale) / 14.0) * 14)
+        return proc_h, proc_w
+
     def load_model(self) -> None:
         """Loads DINOv2 neural backbone onto selected device."""
         if self.model is None:
-            logger.info("Loading model %s on device %s...", self.model_name, self.device)
-            self.model = get_model(self.model_name, self.device, smaller_edge_size=self.img_size)
+            logger.info("Loading model %s (img_size=%d) on device %s...", self.model_name, self.img_size, self.device)
+            self.model = get_model(
+                self.model_name,
+                self.device,
+                smaller_edge_size=self.img_size,
+                feature_layers=self.feature_layers,
+            )
             logger.info("Model loaded successfully.")
 
     def _build_mask(self, shape: tuple) -> Optional[np.ndarray]:
@@ -356,12 +409,13 @@ class PokemonAnomalyDetector:
         if not self.masking_enabled:
             return None
         h, w = shape[:2]
+        feather_px = max(1, int(round(FEATHER_PX * self._res_scale)))
         return rounded_rect_mask(
             h,
             w,
             corner_radius_frac=CORNER_RADIUS_FRAC,
             erode_frac=ERODE_FRAC,
-            feather_px=FEATHER_PX,
+            feather_px=feather_px,
         )
 
     def _preprocess_with_mask(self, img_path: str):
@@ -371,7 +425,7 @@ class PokemonAnomalyDetector:
             raise ValueError(f"Unable to load image: {img_path}")
         self._last_raw_bgr = img.copy()
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        target_h, target_w = TARGET_SIZE
+        target_h, target_w = self._processing_size
         img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
         if (self.luma_matching_enabled and self._ref_luma_stats is not None
@@ -434,7 +488,7 @@ class PokemonAnomalyDetector:
         if self.luma_matching_enabled and image_paths:
             try:
                 base_img = cv2.cvtColor(cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
-                th, tw = TARGET_SIZE
+                th, tw = self._processing_size
                 base_img = cv2.resize(base_img, (tw, th), interpolation=cv2.INTER_LANCZOS4)
                 self._ref_luma_stats = compute_luma_stats(base_img)
                 logger.info("Luma matching target (mean=%.1f, std=%.1f)", *self._ref_luma_stats)
@@ -481,7 +535,7 @@ class PokemonAnomalyDetector:
             cached = None
             if card_id is not None and self.feature_cache_dir:
                 cached = load_cached_features(
-                    self.feature_cache_dir, card_id, label, grid_size, self.model_name
+                    self.feature_cache_dir, card_id, label, grid_size, self._cache_model_tag
                 )
                 if cached is not None and cached.shape[0] != coords_valid.shape[0]:
                     logger.info(
@@ -507,7 +561,7 @@ class PokemonAnomalyDetector:
 
                 if card_id is not None and self.feature_cache_dir:
                     save_cached_features(
-                        self.feature_cache_dir, card_id, label, grid_size, feats, self.model_name
+                        self.feature_cache_dir, card_id, label, grid_size, feats, self._cache_model_tag
                     )
 
             features_list.append(feats)
@@ -925,6 +979,10 @@ class PokemonAnomalyDetector:
         """Returns current operational status of the detector."""
         return {
             "model": self.model_name,
+            "img_size": self.img_size,
+            "processing_size": list(self._processing_size),
+            "scale_with_resolution": self.scale_with_resolution,
+            "feature_layers": list(self.feature_layers) if self.feature_layers else None,
             "device": self.device,
             "memory_bank_ready": self.memory_bank_ready,
             "reference_count": self.reference_count,
