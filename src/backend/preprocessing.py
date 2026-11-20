@@ -25,6 +25,53 @@ def compute_luma_stats(img_rgb: np.ndarray) -> tuple[float, float]:
     l = lab[:, :, 0]
     return float(l.mean()), float(l.std())
 
+
+def compute_lab_stats(
+    img_rgb: np.ndarray,
+    mask: np.ndarray | None = None,
+) -> tuple[float, float, float, float, float, float]:
+    """Compute (mean, std) across L, a, b channels in LAB space within optional mask."""
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    if mask is not None:
+        m = mask > 0.5
+        if np.any(m):
+            vals = lab[m]
+            return (
+                float(vals[:, 0].mean()), float(vals[:, 0].std()),
+                float(vals[:, 1].mean()), float(vals[:, 1].std()),
+                float(vals[:, 2].mean()), float(vals[:, 2].std()),
+            )
+    return (
+        float(lab[:, :, 0].mean()), float(lab[:, :, 0].std()),
+        float(lab[:, :, 1].mean()), float(lab[:, :, 1].std()),
+        float(lab[:, :, 2].mean()), float(lab[:, :, 2].std()),
+    )
+
+
+def match_color_and_luminance(
+    img_rgb: np.ndarray,
+    ref_stats: tuple[float, float, float, float, float, float],
+    alpha_ab: float = 0.65,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Apply full Reinhard L-channel matching and damped a/b white-balance normalization."""
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    ref_l_m, ref_l_s, ref_a_m, ref_a_s, ref_b_m, ref_b_s = ref_stats
+    src_l_m, src_l_s, src_a_m, src_a_s, src_b_m, src_b_s = compute_lab_stats(img_rgb, mask=mask)
+
+    l_matched = np.clip((lab[:, :, 0] - src_l_m) * (ref_l_s / max(src_l_s, 1e-6)) + ref_l_m, 0, 255)
+    a_full = (lab[:, :, 1] - src_a_m) * (ref_a_s / max(src_a_s, 1e-6)) + ref_a_m
+    b_full = (lab[:, :, 2] - src_b_m) * (ref_b_s / max(src_b_s, 1e-6)) + ref_b_m
+    a_matched = np.clip((1.0 - alpha_ab) * lab[:, :, 1] + alpha_ab * a_full, 0, 255)
+    b_matched = np.clip((1.0 - alpha_ab) * lab[:, :, 2] + alpha_ab * b_full, 0, 255)
+
+    lab_eq = cv2.merge([
+        l_matched.astype(np.uint8),
+        a_matched.astype(np.uint8),
+        b_matched.astype(np.uint8),
+    ])
+    return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+
 def match_luminance(
     img_rgb: np.ndarray,
     ref_mean: float,

@@ -65,7 +65,14 @@ from backend.few_shot import (
     save_cached_features,
 )
 from backend.masking import mask_to_grid, rounded_rect_mask
-from backend.preprocessing import apply_clahe, apply_clahe_masked, compute_luma_stats, match_luminance
+from backend.preprocessing import (
+    apply_clahe,
+    apply_clahe_masked,
+    compute_lab_stats,
+    compute_luma_stats,
+    match_color_and_luminance,
+    match_luminance,
+)
 from backend.spatial_morphology import (
     MorphologyConfig,
     MorphologyResult,
@@ -290,6 +297,11 @@ class PokemonAnomalyDetector:
         feature_cache_dir: Optional[str] = None,
         scale_with_resolution: Optional[bool] = None,
         feature_layers: Optional[tuple[int, ...] | list[int]] = None,
+        lab_color_matching: Optional[bool] = None,
+        subpixel_alignment: Optional[bool] = None,
+        erode_frac: Optional[float] = None,
+        feather_px: Optional[int] = None,
+        patch_variance_norm: Optional[bool] = None,
     ):
         """Inizializza i parametri operativi del detector."""
         self.device = device or get_device()
@@ -303,7 +315,24 @@ class PokemonAnomalyDetector:
             luma_matching if luma_matching is not None
             else bool(_CFG["anomaly"].get("luma_matching", False))
         )
+        self.lab_color_matching = bool(
+            _CFG.get("anomaly", {}).get("lab_color_matching", False)
+            if lab_color_matching is None else lab_color_matching
+        )
+        self.subpixel_alignment = bool(
+            _CFG.get("anomaly", {}).get("subpixel_alignment", False)
+            if subpixel_alignment is None else subpixel_alignment
+        )
+        self.patch_variance_norm = bool(
+            _CFG.get("anomaly", {}).get("patch_variance_norm", False)
+            if patch_variance_norm is None else patch_variance_norm
+        )
+        self.erode_frac = float(ERODE_FRAC if erode_frac is None else erode_frac)
+        self.feather_px = int(FEATHER_PX if feather_px is None else feather_px)
         self._ref_luma_stats: Optional[tuple[float, float]] = None
+        self._ref_lab_stats: Optional[tuple[float, float, float, float, float, float]] = None
+        self._ref_gray_align: Optional[np.ndarray] = None
+        self._patch_weights: Optional[np.ndarray] = None
         self._loading_reference: bool = False
         self.orientation_canonicalization = bool(
             _CFG["anomaly"].get("orientation_canonicalization", False)
@@ -323,11 +352,14 @@ class PokemonAnomalyDetector:
         res_scale = float(self.img_size) / float(TARGET_SIZE[1])
         self._res_scale = res_scale
         self._processing_size = self._compute_processing_size(self.img_size)
-        self._cache_model_tag = (
-            f"{self.model_name}_L{'-'.join(map(str, self.feature_layers))}"
-            if self.feature_layers
-            else self.model_name
+        layer_suffix = f"_L{'-'.join(map(str, self.feature_layers))}" if self.feature_layers else ""
+        mask_suffix = (
+            f"_m{self.erode_frac:.3f}_{self.feather_px}"
+            if (abs(self.erode_frac - ERODE_FRAC) > 1e-6 or self.feather_px != FEATHER_PX)
+            else ""
         )
+        color_suffix = "_lab" if self.lab_color_matching else ""
+        self._cache_model_tag = f"{self.model_name}{layer_suffix}{mask_suffix}{color_suffix}"
 
         base_spatial = spatial_config or DEFAULT_SPATIAL_CONFIG
         base_morph = morphology_config or DEFAULT_MORPHOLOGY_CONFIG
@@ -409,17 +441,52 @@ class PokemonAnomalyDetector:
         if not self.masking_enabled:
             return None
         h, w = shape[:2]
-        feather_px = max(1, int(round(FEATHER_PX * self._res_scale)))
+        feather_px = max(1, int(round(self.feather_px * self._res_scale))) if self.feather_px > 0 else 0
         return rounded_rect_mask(
             h,
             w,
             corner_radius_frac=CORNER_RADIUS_FRAC,
-            erode_frac=ERODE_FRAC,
+            erode_frac=self.erode_frac,
             feather_px=feather_px,
         )
 
+    def _align_query_subpixel(self, img_rgb: np.ndarray) -> np.ndarray:
+        """Align query card to canonical reference via fast bounded ECC registration."""
+        if self._ref_gray_align is None:
+            return img_rgb
+        th, tw = img_rgb.shape[:2]
+        ah, aw = self._ref_gray_align.shape[:2]
+        q_small = cv2.GaussianBlur(
+            cv2.resize(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY), (aw, ah), interpolation=cv2.INTER_AREA),
+            (3, 3), 0,
+        )
+        warp = np.eye(2, 3, dtype=np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 1e-3)
+        try:
+            _, warp = cv2.findTransformECC(
+                self._ref_gray_align, q_small, warp, cv2.MOTION_EUCLIDEAN, criteria, None, 3
+            )
+        except cv2.error:
+            return img_rgb
+
+        tx_small, ty_small = float(warp[0, 2]), float(warp[1, 2])
+        sin_t = abs(float(warp[1, 0]))
+        if abs(tx_small) > 12.0 or abs(ty_small) > 12.0 or sin_t > 0.05:
+            return img_rgb
+
+        warp_full = warp.copy()
+        warp_full[0, 2] = tx_small * (float(tw) / float(aw))
+        warp_full[1, 2] = ty_small * (float(th) / float(ah))
+        return cv2.warpAffine(
+            img_rgb,
+            warp_full,
+            (tw, th),
+            flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
     def _preprocess_with_mask(self, img_path: str):
-        """Loads, resizes, and masks image with guided CLAHE."""
+        """Loads, resizes, optionally aligns, color-matches, and masks image with guided CLAHE."""
         img = cv2.imread(img_path, cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError(f"Unable to load image: {img_path}")
@@ -428,11 +495,16 @@ class PokemonAnomalyDetector:
         target_h, target_w = self._processing_size
         img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
-        if (self.luma_matching_enabled and self._ref_luma_stats is not None
-                and not self._loading_reference):
-            img = match_luminance(img, *self._ref_luma_stats)
+        if self.subpixel_alignment and not self._loading_reference:
+            img = self._align_query_subpixel(img)
 
         mask = self._build_mask(img.shape)
+        if not self._loading_reference:
+            if self.lab_color_matching and self._ref_lab_stats is not None:
+                img = match_color_and_luminance(img, self._ref_lab_stats, alpha_ab=0.65, mask=mask)
+            elif self.luma_matching_enabled and self._ref_luma_stats is not None:
+                img = match_luminance(img, *self._ref_luma_stats)
+
         if self.clahe_enabled:
             if mask is not None:
                 img = apply_clahe_masked(
@@ -472,6 +544,9 @@ class PokemonAnomalyDetector:
             self.current_card_id = card_id
             self.few_shot_variants = []
             self._ref_luma_stats = None
+            self._ref_lab_stats = None
+            self._ref_gray_align = None
+            self._patch_weights = None
             logger.info("Updated card_id: %s. Memory bank reset.", card_id)
 
         few_shot_paths = []
@@ -485,16 +560,24 @@ class PokemonAnomalyDetector:
 
         effective_paths = few_shot_paths if few_shot_paths else image_paths
 
-        if self.luma_matching_enabled and image_paths:
+        if (self.luma_matching_enabled or self.lab_color_matching or self.subpixel_alignment) and image_paths:
             try:
                 base_img = cv2.cvtColor(cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
                 th, tw = self._processing_size
                 base_img = cv2.resize(base_img, (tw, th), interpolation=cv2.INTER_LANCZOS4)
+                base_mask = self._build_mask(base_img.shape)
                 self._ref_luma_stats = compute_luma_stats(base_img)
-                logger.info("Luma matching target (mean=%.1f, std=%.1f)", *self._ref_luma_stats)
+                self._ref_lab_stats = compute_lab_stats(base_img, mask=base_mask)
+                self._ref_gray_align = cv2.GaussianBlur(
+                    cv2.resize(cv2.cvtColor(base_img, cv2.COLOR_RGB2GRAY), (224, 336), interpolation=cv2.INTER_AREA),
+                    (3, 3), 0,
+                )
+                logger.info("Reference photometric & alignment template prepared (L=%.1f, std=%.1f)", *self._ref_luma_stats)
             except Exception as e:
-                logger.warning("Luma stats computation failed: %s. Luma matching disabled.", e)
+                logger.warning("Reference stats/template setup failed: %s", e)
                 self._ref_luma_stats = None
+                self._ref_lab_stats = None
+                self._ref_gray_align = None
 
         features_list = []
         coords_list = []
@@ -589,6 +672,21 @@ class PokemonAnomalyDetector:
         self.reference_count = len(features_list) if self.use_few_shot else 1
         self.memory_bank_ready = True
 
+        # Per-patch photometric stability weights across the few-shot bank
+        self._patch_weights = None
+        if len(features_list) >= 3:
+            n_base = features_list[0].shape[0]
+            if all(f.shape[0] == n_base for f in features_list[1:]):
+                base_n = features_list[0] / np.maximum(np.linalg.norm(features_list[0], axis=1, keepdims=True), 1e-8)
+                d_vars = []
+                for vf in features_list[1:]:
+                    vf_n = vf / np.maximum(np.linalg.norm(vf, axis=1, keepdims=True), 1e-8)
+                    d_vars.append(1.0 - np.sum(vf_n * base_n, axis=1))
+                sigma_patch = np.percentile(np.stack(d_vars, axis=0), 75, axis=0)
+                med_sigma = float(np.median(sigma_patch)) + 1e-6
+                weights = np.clip(med_sigma / np.maximum(sigma_patch, 0.35 * med_sigma), 0.55, 1.45)
+                self._patch_weights = weights.astype(np.float32)
+
         logger.info(
             "Memory bank configurato: One-Shot=%d feature, Few-Shot=%d feature (%d reference totali).",
             self.ref_features_oneshot.shape[0],
@@ -636,6 +734,9 @@ class PokemonAnomalyDetector:
                     top_sim, _ = sim.topk(self.knn_neighbors, dim=1)
                     max_sim = top_sim.mean(dim=1)
                 distances = (1.0 - max_sim).clamp(min=0.0).cpu().numpy().astype(np.float32)
+
+        if self.patch_variance_norm and self._patch_weights is not None and len(self._patch_weights) == len(distances):
+            distances = (distances * self._patch_weights).astype(np.float32)
 
         full_dists = np.zeros(full_shape, dtype=np.float32)
         if grid_mask_flat is not None:
@@ -983,6 +1084,9 @@ class PokemonAnomalyDetector:
             "processing_size": list(self._processing_size),
             "scale_with_resolution": self.scale_with_resolution,
             "feature_layers": list(self.feature_layers) if self.feature_layers else None,
+            "lab_color_matching": self.lab_color_matching,
+            "subpixel_alignment": self.subpixel_alignment,
+            "patch_variance_norm": self.patch_variance_norm,
             "device": self.device,
             "memory_bank_ready": self.memory_bank_ready,
             "reference_count": self.reference_count,
