@@ -142,7 +142,7 @@ def _build_backends(cfg: dict) -> dict[str, object]:
         "unet_weights", "data/weights/seg_canonical_unet_best.pt"
     )
     if wunet.exists():
-        backends["obb_unet"] = build_card_detector(cfg, backend="obb_unet")
+        backends["obb_unet"] = build_card_detector(backend="obb_unet")
 
     return backends
 

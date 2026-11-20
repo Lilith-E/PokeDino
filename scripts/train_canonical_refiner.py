@@ -228,7 +228,8 @@ def _save_training_plots(history: list[dict], out_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Stage-2 Canonical MobileNetV3-UNet refiner.")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--patience", type=int, default=15, help="Early-stopping patience on validation score (0=off).")
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3.5e-4)
     parser.add_argument("--workers", type=int, default=4)
@@ -276,6 +277,7 @@ def main() -> None:
         "canon_size": [CANON_H, CANON_W],
         "corridor_px": corridor_px,
         "epochs": args.epochs,
+        "patience": args.patience,
         "batch_size": args.batch,
         "lr": args.lr,
         "optimizer": "AdamW",
@@ -291,6 +293,7 @@ def main() -> None:
 
     best_score = -1e9
     best_corner_err = float("inf")
+    no_improve = 0
     history: list[dict] = []
 
     for epoch in range(1, args.epochs + 1):
@@ -341,6 +344,7 @@ def main() -> None:
         if selection_score > best_score:
             best_score = selection_score
             best_corner_err = val_stats["corner_err_mean"]
+            no_improve = 0
             cpu_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
             ckpt_payload = {
                 "model": cpu_state,
@@ -355,6 +359,15 @@ def main() -> None:
             exp.log_metric("best_val_iou", val_stats["iou"])
             exp.log_metric("best_val_boundary_iou", val_stats["boundary_iou"])
             exp.log_metric("best_val_corner_err_px", val_stats["corner_err_mean"])
+        else:
+            no_improve += 1
+            if args.patience > 0 and no_improve >= args.patience:
+                logger.info(
+                    "Early stopping triggered after %d epochs without validation improvement (best corner_err=%.2f px).",
+                    args.patience,
+                    best_corner_err,
+                )
+                break
 
     # Evaluate final best checkpoint on held-out test split.
     best_ckpt = torch.load(out_weights, map_location=device, weights_only=True)

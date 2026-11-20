@@ -501,6 +501,7 @@ class OBBCanonicalUNetDetector:
         candidates = [
             explicit,
             ou_cfg.get("obb_weights"),
+            "data/weights/yolo11l_obb_heavy_best.pt",
             "data/weights/yolo11m_obb_paired_best.pt",
             "data/weights/yolo11s_obb_paired_best.pt",
             "data/weights/yolo11s_obb_finetuned_best.pt",

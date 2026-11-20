@@ -143,7 +143,7 @@ def main() -> None:
         "unet_weights", "data/weights/seg_canonical_unet_best.pt"
     )
     if w_unet.exists():
-        backends.append(("OBB + Canon UNet", build_card_detector(cfg, backend="obb_unet")))
+        backends.append(("OBB + Canon UNet", build_card_detector(backend="obb_unet")))
 
     if not args.only_obb_variants:
         w640 = PROJECT_ROOT / cfg["segmentation"]["yolo_seg"]["weights"]

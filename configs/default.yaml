@@ -20,7 +20,7 @@ paths:
 detector:
   backend: obb_pbl              # obb_pbl | obb_unet | seg_yolo | seg_zeroshot | seg_semantic
   obb_unet:
-    obb_weights: data/weights/yolo11m_obb_paired_best.pt
+    obb_weights: data/weights/yolo11l_obb_heavy_best.pt
     unet_weights: data/weights/seg_canonical_unet_best.pt
     adaptive_tta: true
     adaptive_tta_conf: 0.75
