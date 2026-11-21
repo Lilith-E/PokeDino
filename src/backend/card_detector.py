@@ -13,6 +13,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from backend.rectifier import _subpixel_peak_1d, warp_perspective_antialiased
+
 logger = logging.getLogger(__name__)
 
 TARGET_H = 630
@@ -573,23 +575,29 @@ class CardDetector:
         gx = np.abs(cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3))
 
         def _sample_edge(mag, expected_pos, axis, s_out, s_in):
-            """Sample edge points along one border using directional gradient magnitude."""
+            """Sample edge points along one border using sub-pixel weighted gradient peaks."""
             pts = []
+            lo_idx = max(2, expected_pos - s_out)
+            hi_idx = min((H_pad - 3) if axis == 'h' else (W_pad - 3), expected_pos + s_in)
+            if hi_idx <= lo_idx + 2:
+                return np.empty((0, 2), dtype=np.float32)
+            dists = np.arange(lo_idx, hi_idx, dtype=np.float32) - float(expected_pos)
+            prior = np.exp(-0.5 * (dists / 10.0) ** 2)
             for t in np.linspace(0.18, 0.82, n_samples):
                 if axis == 'h':
                     x = int(pad + t * (target_w - 1))
-                    y_lo = max(2, expected_pos - s_out)
-                    y_hi = min(H_pad - 3, expected_pos + s_in)
-                    col = mag[y_lo:y_hi, x]
-                    if len(col) > 0 and col.max() > 25:
-                        pts.append([x, y_lo + int(np.argmax(col))])
+                    col = mag[lo_idx:hi_idx, x]
+                    if len(col) > 0:
+                        idx_m = int(np.argmax(col * prior))
+                        if float(col[idx_m]) > 25.0:
+                            pts.append([float(x), float(lo_idx) + _subpixel_peak_1d(col, idx_m)])
                 else:
                     y = int(pad + t * (target_h - 1))
-                    x_lo = max(2, expected_pos - s_out)
-                    x_hi = min(W_pad - 3, expected_pos + s_in)
-                    row = mag[y, x_lo:x_hi]
-                    if len(row) > 0 and row.max() > 25:
-                        pts.append([x_lo + int(np.argmax(row)), y])
+                    row = mag[y, lo_idx:hi_idx]
+                    if len(row) > 0:
+                        idx_m = int(np.argmax(row * prior))
+                        if float(row[idx_m]) > 25.0:
+                            pts.append([float(lo_idx) + _subpixel_peak_1d(row, idx_m), float(y)])
             return np.array(pts, dtype=np.float32) if pts else np.empty((0, 2), dtype=np.float32)
 
         top_pts = _sample_edge(gy, pad, 'h', search_out, search_in)
@@ -651,8 +659,8 @@ class CardDetector:
                 0.90 * target_h <= h_right <= 1.10 * target_h):
             return None, q
 
-        if (abs(w_top - w_bot) / max(w_top, w_bot, 1.0) > 0.035 or
-                abs(h_left - h_right) / max(h_left, h_right, 1.0) > 0.035):
+        if (abs(w_top - w_bot) / max(w_top, w_bot, 1.0) > 0.16 or
+                abs(h_left - h_right) / max(h_left, h_right, 1.0) > 0.16):
             return None, q
 
         try:
@@ -664,7 +672,14 @@ class CardDetector:
                 [0, 0], [target_w - 1, 0], [target_w - 1, target_h - 1], [0, target_h - 1]
             ], dtype=np.float32)
             M_final = cv2.getPerspectiveTransform(refined_corners.astype(np.float32), dst_final)
-            warped = cv2.warpPerspective(img_bgr, M_final, (target_w, target_h))
+            warped = warp_perspective_antialiased(
+                img_bgr,
+                M_final,
+                (target_w, target_h),
+                quad_corners=refined_corners,
+                flags=cv2.INTER_LANCZOS4,
+                border_mode=cv2.BORDER_REPLICATE,
+            )
             if warped is None or warped.mean() < 1:
                 return None, q
             return cv2.cvtColor(warped, cv2.COLOR_BGR2RGB), refined_corners
@@ -674,7 +689,7 @@ class CardDetector:
     def _refine_warp(self, img_bgr: np.ndarray, corners: np.ndarray):
         """Snap the quad to edge evidence only when the correction stays within 5 px."""
         patch, refined_corners = self._refine_quad_lines(img_bgr, corners)
-        if patch is not None and self._quad_distance(refined_corners, corners) <= 5.0:
+        if patch is not None and self._quad_distance(refined_corners, corners) <= 6.5:
             return patch, refined_corners
         return self.warp_card(img_bgr, corners), corners
 
@@ -687,7 +702,14 @@ class CardDetector:
             np.float32,
         )
         M = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
-        warped = cv2.warpPerspective(img_bgr, M, (self.target_w, self.target_h))
+        warped = warp_perspective_antialiased(
+            img_bgr,
+            M,
+            (self.target_w, self.target_h),
+            quad_corners=quad,
+            flags=cv2.INTER_LANCZOS4,
+            border_mode=cv2.BORDER_REPLICATE,
+        )
         if warped is None or warped.mean() < 1:
             return None
         return cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)

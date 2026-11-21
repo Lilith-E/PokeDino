@@ -66,6 +66,7 @@ from backend.few_shot import (
 )
 from backend.masking import mask_to_grid, rounded_rect_mask
 from backend.preprocessing import apply_clahe, apply_clahe_masked, compute_luma_stats, match_luminance
+from backend.rectifier import align_patch_to_reference_homography, build_alignment_feature_map
 from backend.spatial_morphology import (
     MorphologyConfig,
     MorphologyResult,
@@ -288,6 +289,7 @@ class PokemonAnomalyDetector:
         spatial_config: Optional[SpatialSearchConfig] = None,
         morphology_config: Optional[MorphologyConfig] = None,
         feature_cache_dir: Optional[str] = None,
+        subpixel_alignment: Optional[bool] = None,
     ):
         """Inizializza i parametri operativi del detector."""
         self.device = device or get_device()
@@ -301,7 +303,12 @@ class PokemonAnomalyDetector:
             luma_matching if luma_matching is not None
             else bool(_CFG["anomaly"].get("luma_matching", False))
         )
+        self.subpixel_alignment = bool(
+            _CFG["anomaly"].get("subpixel_alignment", False)
+            if subpixel_alignment is None else subpixel_alignment
+        )
         self._ref_luma_stats: Optional[tuple[float, float]] = None
+        self._ref_align_map: Optional[np.ndarray] = None
         self._loading_reference: bool = False
         self.orientation_canonicalization = bool(
             _CFG["anomaly"].get("orientation_canonicalization", False)
@@ -378,10 +385,6 @@ class PokemonAnomalyDetector:
         target_h, target_w = TARGET_SIZE
         img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
-        if (self.luma_matching_enabled and self._ref_luma_stats is not None
-                and not self._loading_reference):
-            img = match_luminance(img, *self._ref_luma_stats)
-
         if not self.masking_enabled:
             mask = None
         elif override_mask is not None:
@@ -391,6 +394,17 @@ class PokemonAnomalyDetector:
             mask = np.clip(mask, 0.0, 1.0)
         else:
             mask = self._build_mask(img.shape)
+
+        if self.subpixel_alignment and not self._loading_reference and self._ref_align_map is not None:
+            img, aligned_mask, _ = align_patch_to_reference_homography(
+                img, self._ref_align_map, mask=mask if override_mask is not None else None
+            )
+            if override_mask is not None and aligned_mask is not None:
+                mask = aligned_mask
+
+        if (self.luma_matching_enabled and self._ref_luma_stats is not None
+                and not self._loading_reference):
+            img = match_luminance(img, *self._ref_luma_stats)
 
         if self.clahe_enabled:
             if mask is not None:
@@ -431,6 +445,7 @@ class PokemonAnomalyDetector:
             self.current_card_id = card_id
             self.few_shot_variants = []
             self._ref_luma_stats = None
+            self._ref_align_map = None
             logger.info("Updated card_id: %s. Memory bank reset.", card_id)
 
         few_shot_paths = []
@@ -444,16 +459,21 @@ class PokemonAnomalyDetector:
 
         effective_paths = few_shot_paths if few_shot_paths else image_paths
 
-        if self.luma_matching_enabled and image_paths:
+        if (self.luma_matching_enabled or self.subpixel_alignment) and image_paths:
             try:
                 base_img = cv2.cvtColor(cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
                 th, tw = TARGET_SIZE
                 base_img = cv2.resize(base_img, (tw, th), interpolation=cv2.INTER_LANCZOS4)
-                self._ref_luma_stats = compute_luma_stats(base_img)
-                logger.info("Luma matching target (mean=%.1f, std=%.1f)", *self._ref_luma_stats)
+                if self.luma_matching_enabled:
+                    self._ref_luma_stats = compute_luma_stats(base_img)
+                    logger.info("Luma matching target (mean=%.1f, std=%.1f)", *self._ref_luma_stats)
+                if self.subpixel_alignment:
+                    self._ref_align_map = build_alignment_feature_map(base_img, align_size_wh=(224, 315))
+                    logger.info("Reference homography alignment template prepared (224x315)")
             except Exception as e:
-                logger.warning("Luma stats computation failed: %s. Luma matching disabled.", e)
+                logger.warning("Reference stats/template setup failed: %s.", e)
                 self._ref_luma_stats = None
+                self._ref_align_map = None
 
         features_list = []
         coords_list = []
@@ -791,6 +811,7 @@ class PokemonAnomalyDetector:
             },
             "clahe_enabled": self.clahe_enabled,
             "masking_enabled": self.masking_enabled,
+            "subpixel_alignment": self.subpixel_alignment,
             "dead_zone": dz,
             "gamma": g,
             "few_shot": self.use_few_shot,
@@ -964,6 +985,7 @@ class PokemonAnomalyDetector:
             "model_loaded": self.model is not None,
             "clahe_enabled": self.clahe_enabled,
             "masking_enabled": self.masking_enabled,
+            "subpixel_alignment": self.subpixel_alignment,
             "dead_zone": self.dead_zone,
             "gamma": self.gamma,
             "spatial_search": {

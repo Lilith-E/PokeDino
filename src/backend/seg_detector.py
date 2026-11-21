@@ -141,6 +141,8 @@ class SegmentationCardDetector:
         self.edge_fit_method = str(rect_cfg.get("edge_fit_method", "ransac"))
         self.corner_excl_frac = float(rect_cfg.get("corner_excl_frac", 0.14))
         self.min_side_inliers = int(rect_cfg.get("min_side_inliers", 12))
+        self.min_span_frac = float(rect_cfg.get("min_span_frac", 0.30))
+        self.max_side_tilt_rad = float(rect_cfg.get("max_side_tilt_rad", 0.20))
         self.ransac_thresh_px = float(rect_cfg.get("ransac_thresh_px", 2.5))
         self.ransac_iters = int(rect_cfg.get("ransac_iters", 120))
         self.erode_mask_px = int(rect_cfg.get("erode_mask_px", 2))
@@ -148,6 +150,8 @@ class SegmentationCardDetector:
         self.refine_edges = bool(
             rect_cfg.get("refine_edges", True) if refine_edges is None else refine_edges
         )
+        self.refine_iters = int(rect_cfg.get("refine_iters", 2))
+        self.antialiased_warp = bool(rect_cfg.get("antialiased_warp", True))
         self.crop_refine = False
 
         self.model = None
@@ -231,6 +235,10 @@ class SegmentationCardDetector:
             erode_mask_px=self.erode_mask_px,
             feather_px=self.feather_px,
             refine_edges=self.refine_edges,
+            refine_iters=self.refine_iters,
+            antialiased_warp=self.antialiased_warp,
+            min_span_frac=self.min_span_frac,
+            max_side_tilt_rad=self.max_side_tilt_rad,
         )
         if res is None:
             return None
@@ -291,7 +299,7 @@ class SegmentationCardDetector:
             iou = inter / union if union > 0 else 0.0
             if iou > best_iou:
                 best_iou = iou
-                best_roi_mask = rm_bin.astype(np.float32)
+                best_roi_mask = np.clip(rm, 0.0, 1.0).astype(np.float32)
 
         if best_roi_mask is None or best_iou < 0.82:
             return global_mask
@@ -357,10 +365,10 @@ class SegmentationCardDetector:
                 continue
 
             rank_score = conf * fill_ratio / (1.0 + 2.0 * abs(ar - (88.0 / 63.0)))
-            mask_bin_f = (m_resized >= 0.5).astype(np.float32)
+            mask_soft = np.clip(m_resized, 0.0, 1.0).astype(np.float32)
             if self.crop_refine and self.backend == "seg_yolo":
-                mask_bin_f = self._refine_mask_on_roi(img_bgr, mask_bin_f, kwargs)
-            candidates.append((rank_score, mask_bin_f, conf))
+                mask_soft = self._refine_mask_on_roi(img_bgr, mask_soft, kwargs)
+            candidates.append((rank_score, mask_soft, conf))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
         detections: list[CardDetection] = []
@@ -385,12 +393,15 @@ class SegmentationCardDetector:
         n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
 
         candidates: list[tuple[float, np.ndarray, float]] = []
+        dil_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         for lbl in range(1, n_labels):
             area = int(stats[lbl, cv2.CC_STAT_AREA])
             area_frac = area / max(img_area, 1.0)
             if area_frac < self.min_area_frac:
                 continue
-            inst_mask = (labels == lbl).astype(np.float32)
+            comp = (labels == lbl).astype(np.uint8)
+            support = (cv2.dilate(comp, dil_kernel) > 0) & ((labels == 0) | (labels == lbl))
+            inst_mask = np.where(support, prob_full, 0.0).astype(np.float32)
             mean_prob = float(prob_full[labels == lbl].mean())
             candidates.append((mean_prob * area_frac, inst_mask, mean_prob))
 
@@ -463,6 +474,7 @@ class OBBCanonicalUNetDetector:
         self.corner_excl_frac = float(rect_cfg.get("corner_excl_frac", 0.14))
         self.erode_mask_px = int(rect_cfg.get("erode_mask_px", 2))
         self.feather_px = int(rect_cfg.get("feather_px", 3))
+        self.antialiased_warp = bool(rect_cfg.get("antialiased_warp", True))
 
         resolved_obb = self._resolve_obb_weights(obb_weights, ou_cfg)
         self.obb_detector = CardDetector(
@@ -547,6 +559,7 @@ class OBBCanonicalUNetDetector:
                 corner_excl_frac=self.corner_excl_frac,
                 erode_mask_px=self.erode_mask_px,
                 feather_px=self.feather_px,
+                antialiased_warp=self.antialiased_warp,
             )
             if res is None:
                 continue

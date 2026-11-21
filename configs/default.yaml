@@ -35,11 +35,15 @@ detector:
     edge_fit_method: ransac     # ransac | huber
     corner_excl_frac: 0.14      # Fraction trimmed at each end of an edge to exclude rounded corners
     min_side_inliers: 12
+    min_span_frac: 0.30         # Minimum normalized projection span covered by side inliers
+    max_side_tilt_rad: 0.20     # Max angle deviation (rad) of a fitted side relative to initial box
     ransac_thresh_px: 2.5
     ransac_iters: 120
     erode_mask_px: 2            # Slight inward erosion of warped mask to suppress border bleed
     feather_px: 3
     refine_edges: true          # Snap segmentation borders to full-res Sobel + Lab gradients
+    refine_iters: 2             # Iterative canonical edge-snap passes (coarse + sub-pixel fine)
+    antialiased_warp: true      # Mipmap/Gaussian pre-filter before warpPerspective when downsampling
 
 segmentation:
   dataset:
@@ -183,6 +187,7 @@ anomaly:
   img_size: 448
   target_size: [630, 448]
   luma_matching: true          # Global exposure matching of the query toward the reference luminance
+  subpixel_alignment: false    # Optional reference-guided bounded homography ECC in Stage 6
   orientation_canonicalization: true  # Score 0/90/180/270 orientations, keep the best (rotation-invariant inspection)
   knn_neighbors: 1
   score_top_percent: 1.0       # Media dell'1% superiore delle distanze dei patch
