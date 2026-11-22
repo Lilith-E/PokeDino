@@ -696,6 +696,7 @@ def _extract_dp_edge_seam(
     offsets: np.ndarray,
     smoothness_weight: float = 0.35,
     prior_weight: float = 0.05,
+    outer_ramp_anchor: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Find optimal continuous seam across N scanlines using exact O(N*M) L1 Viterbi DP."""
     n_rays, n_off = energy_strip.shape
@@ -740,11 +741,29 @@ def _extract_dp_edge_seam(
     confs = np.empty(n_rays, dtype=np.float64)
     for r in range(n_rays):
         idx = int(path[r])
-        sub_idx = _subpixel_peak_1d(energy_strip[r], idx)
+        row_e = energy_strip[r]
+        sub_idx = _subpixel_peak_1d(row_e, idx)
+        if outer_ramp_anchor and idx >= 1:
+            # Shift adaptively onto the outward rising slope (0.62 * peak) proportional
+            # to the local gradient blur width, avoiding inward border clipping on camera ramps.
+            peak_val = float(row_e[idx])
+            target_val = 0.62 * peak_val
+            outer_idx = sub_idx
+            for back_step in (1, 2):
+                j = idx - back_step
+                if j < 0:
+                    break
+                v_cur = float(row_e[j + 1])
+                v_out = float(row_e[j])
+                if v_out <= target_val < v_cur:
+                    frac_out = (target_val - v_out) / max(v_cur - v_out, 1e-6)
+                    outer_idx = float(j) + frac_out
+                    break
+            sub_idx = max(sub_idx - 1.5, min(sub_idx, outer_idx))
         lo_i = max(0, min(n_off - 2, int(np.floor(sub_idx))))
         frac = sub_idx - float(lo_i)
         sub_offsets[r] = float(offsets[lo_i] + frac * (offsets[lo_i + 1] - offsets[lo_i]))
-        confs[r] = float(energy_strip[r, idx])
+        confs[r] = float(row_e[idx])
     return sub_offsets, confs
 
 
@@ -862,6 +881,131 @@ def _fit_joint_projective_quad(
     return q.reshape(4, 2)
 
 
+def _fit_rigid_6dof_perspective_quad(
+    scene_pts_list: list[np.ndarray],
+    scene_weights_list: list[np.ndarray],
+    q_init_scene: np.ndarray,
+    img_shape_hw: tuple[int, int],
+    n_iters: int = 8,
+) -> Optional[np.ndarray]:
+    """Fit exact 3D rigid planar 63x88 perspective pose (rvec, tvec, focal) via Huber-IRLS.
+
+    Every candidate quad is a strict perspective projection of the physical 63:88 card
+    rectangle in 3D space, eliminating non-perspective shear/skew at arbitrary tilt angles.
+    """
+    pts_all = [np.asarray(p, dtype=np.float64) for p in scene_pts_list]
+    wts_all = [np.asarray(w, dtype=np.float64) for w in scene_weights_list]
+    if sum(len(p) for p in pts_all) < 16:
+        return None
+
+    h_img, w_img = int(img_shape_hw[0]), int(img_shape_hw[1])
+    f0 = 1.25 * float(max(h_img, w_img, 100))
+    cx, cy = 0.5 * float(w_img), 0.5 * float(h_img)
+    obj_pts = np.array(
+        [[-31.5, -44.0, 0.0], [31.5, -44.0, 0.0], [31.5, 44.0, 0.0], [-31.5, 44.0, 0.0]],
+        dtype=np.float64,
+    )
+
+    K0 = np.array([[f0, 0.0, cx], [0.0, f0, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+    q0 = order_quad(q_init_scene).astype(np.float64)
+    try:
+        ok, rvec0, tvec0 = cv2.solvePnP(obj_pts, q0, K0, None, flags=cv2.SOLVEPNP_IPPE)
+        if not ok or float(tvec0[2, 0]) <= 1.0:
+            ok, rvec0, tvec0 = cv2.solvePnP(obj_pts, q0, K0, None, flags=cv2.SOLVEPNP_ITERATIVE)
+    except cv2.error:
+        return None
+    if not ok or not (np.all(np.isfinite(rvec0)) and np.all(np.isfinite(tvec0))) or float(tvec0[2, 0]) <= 1.0:
+        return None
+
+    theta = np.concatenate([rvec0.reshape(3), tvec0.reshape(3), np.array([0.0], dtype=np.float64)])
+    short_scene = float(min(np.linalg.norm(q0[1] - q0[0]), np.linalg.norm(q0[3] - q0[0])))
+    huber_delta = 2.0 * max(short_scene / float(TARGET_W), 0.8)
+
+    def _project(th: np.ndarray) -> Optional[np.ndarray]:
+        log_fs = float(np.clip(th[6], -0.65, 0.65))
+        f_cur = f0 * float(np.exp(log_fs))
+        K = np.array([[f_cur, 0.0, cx], [0.0, f_cur, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+        proj, _ = cv2.projectPoints(obj_pts, th[:3].reshape(3, 1), th[3:6].reshape(3, 1), K, None)
+        qp = proj.reshape(4, 2)
+        if not np.all(np.isfinite(qp)):
+            return None
+        return qp
+
+    def _residuals(th: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        qp = _project(th)
+        if qp is None:
+            return np.full(1, 1e6, dtype=np.float64), np.ones(1, dtype=np.float64)
+        res_list: list[np.ndarray] = []
+        base_w: list[np.ndarray] = []
+        for s in range(4):
+            pts = pts_all[s]
+            if len(pts) == 0:
+                continue
+            pa = qp[s]
+            pb = qp[(s + 1) % 4]
+            edge = pb - pa
+            elen = max(float(np.linalg.norm(edge)), 1e-6)
+            n_vec = np.array([-edge[1] / elen, edge[0] / elen], dtype=np.float64)
+            d = np.sum((pts - pa[None, :]) * n_vec[None, :], axis=1)
+            res_list.append(d)
+            base_w.append(wts_all[s])
+        if not res_list:
+            return np.zeros(1, dtype=np.float64), np.ones(1, dtype=np.float64)
+
+        r_data = np.concatenate(res_list)
+        w_data = np.concatenate(base_w)
+        abs_d = np.abs(r_data)
+        huber_w = np.where(abs_d <= huber_delta, 1.0, huber_delta / np.maximum(abs_d, 1e-6))
+        w_eff = w_data * huber_w
+
+        # Gentle focal regularization around default pinhole prior
+        r_f = np.array([float(th[6]) * max(short_scene * 0.15, 10.0)], dtype=np.float64)
+        w_f = np.array([0.05 * max(float(np.sum(w_data)), 1.0)], dtype=np.float64)
+        return np.concatenate([r_data, r_f]), np.concatenate([w_eff, w_f])
+
+    eps_step = np.array([1e-4, 1e-4, 1e-4, 1e-2, 1e-2, 1e-2, 1e-3], dtype=np.float64)
+    for _ in range(n_iters):
+        r0, w0 = _residuals(theta)
+        sqrt_w = np.sqrt(np.maximum(w0, 0.0))
+        rw0 = np.where(np.abs(r0 * sqrt_w) < 1e-12, 0.0, r0 * sqrt_w)
+        cost0 = float(np.sum(rw0 * rw0))
+
+        J = np.empty((len(r0), 7), dtype=np.float64)
+        for j in range(7):
+            th_p = theta.copy()
+            th_p[j] += eps_step[j]
+            rp, _ = _residuals(th_p)
+            J[:, j] = ((rp - r0) / eps_step[j]) * sqrt_w
+
+        J = np.where(np.abs(J) < 1e-12, 0.0, J)
+        JTJ = np.einsum("ni,nj->ij", J, J) + 1e-4 * np.eye(7)
+        JTr = np.einsum("ni,n->i", J, rw0)
+        try:
+            dth = -np.linalg.solve(JTJ, JTr)
+        except np.linalg.LinAlgError:
+            break
+        if not np.all(np.isfinite(dth)) or float(np.linalg.norm(dth)) < 1e-5:
+            break
+
+        accepted = False
+        for alpha in (1.0, 0.5, 0.25, 0.1):
+            th_try = theta + alpha * dth
+            th_try[6] = float(np.clip(th_try[6], -0.65, 0.65))
+            r_try, _ = _residuals(th_try)
+            cost_try = float(np.sum(np.square(r_try * sqrt_w)))
+            if cost_try < cost0:
+                theta = th_try
+                accepted = True
+                break
+        if not accepted:
+            break
+
+    q_final = _project(theta)
+    if q_final is None or not _is_convex_quad(q_final):
+        return None
+    return order_quad(q_final)
+
+
 def refine_card_quad(
     img_bgr: np.ndarray,
     quad: np.ndarray,
@@ -870,6 +1014,8 @@ def refine_card_quad(
     search_band_frac: float = 0.06,
     dp_smoothness_weight: float = 0.35,
     aspect_prior_weight: float = 0.15,
+    outer_ramp_anchor: bool = True,
+    rigid_6dof_pose: bool = True,
     corner_excl_frac: float = 0.14,
     n_samples: int = 80,
     n_iters: int = 2,
@@ -926,7 +1072,12 @@ def refine_card_quad(
             gy = (bases[:, 1:2] + offsets[None, :] * n_in[1]).astype(np.float32)
             emap = ey if s in (0, 2) else ex
             strip = cv2.remap(emap, gx, gy, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
-            sub_off, confs = _extract_dp_edge_seam(strip, offsets, smoothness_weight=dp_smoothness_weight)
+            sub_off, confs = _extract_dp_edge_seam(
+                strip,
+                offsets,
+                smoothness_weight=dp_smoothness_weight,
+                outer_ramp_anchor=outer_ramp_anchor,
+            )
             if len(sub_off) == 0:
                 pts_list.append(np.empty((0, 2), dtype=np.float64))
                 wts_list.append(np.empty(0, dtype=np.float64))
@@ -958,20 +1109,31 @@ def refine_card_quad(
         return pts_list, wts_list
 
     def _eval_quad_energy(ey: np.ndarray, ex: np.ndarray, q_box: np.ndarray) -> float:
+        ctr = q_box.mean(axis=0)
+        in_probes = (0.0, 0.75, 1.5) if outer_ramp_anchor else (0.0,)
         scores: list[float] = []
         for s in range(4):
             p1, p2 = q_box[s], q_box[(s + 1) % 4]
-            pts = p1[None, :] + ts[:, None] * (p2 - p1)[None, :]
+            edge = p2 - p1
+            elen = max(float(np.linalg.norm(edge)), 1.0)
+            n_in = np.array([-edge[1] / elen, edge[0] / elen], dtype=np.float64)
+            if float(np.dot(ctr - 0.5 * (p1 + p2), n_in)) < 0.0:
+                n_in = -n_in
+            pts = p1[None, :] + ts[:, None] * edge[None, :]
             emap = ey if s in (0, 2) else ex
-            vals = cv2.remap(
-                emap,
-                pts[:, 0:1].astype(np.float32),
-                pts[:, 1:2].astype(np.float32),
-                interpolation=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0.0,
-            )
-            scores.append(float(np.mean(vals)))
+            best_vals = np.zeros(len(pts), dtype=np.float32)
+            for d_in in in_probes:
+                p_probe = pts + d_in * n_in[None, :]
+                vals = cv2.remap(
+                    emap,
+                    p_probe[:, 0:1].astype(np.float32),
+                    p_probe[:, 1:2].astype(np.float32),
+                    interpolation=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0.0,
+                ).reshape(-1)
+                best_vals = np.maximum(best_vals, vals)
+            scores.append(float(np.mean(best_vals)))
         return float(np.mean(scores))
 
     n_passes = max(1, int(n_iters))
@@ -1003,10 +1165,27 @@ def refine_card_quad(
 
         pts_list, wts_list = _sample_strip_energy(ey, ex, nom_pad, offsets)
 
-        # Exact closed-form Huber line intersection when all 4 edges have strong inlier support;
-        # otherwise solve jointly on the 88:63 projective manifold via Huber-IRLS.
         cand_pad: Optional[np.ndarray] = None
-        if all(len(p) >= 12 for p in pts_list):
+        if rigid_6dof_pose:
+            scene_pts_list: list[np.ndarray] = []
+            for p_s in pts_list:
+                if len(p_s) > 0:
+                    sp = cv2.perspectiveTransform(p_s.astype(np.float32).reshape(1, -1, 2), M_inv).reshape(-1, 2).astype(np.float64)
+                    scene_pts_list.append(sp)
+                else:
+                    scene_pts_list.append(np.empty((0, 2), dtype=np.float64))
+            q_rigid_scene = _fit_rigid_6dof_perspective_quad(
+                scene_pts_list,
+                wts_list,
+                q_cur,
+                img_bgr.shape[:2],
+            )
+            if q_rigid_scene is not None:
+                cand_pad = cv2.perspectiveTransform(
+                    q_rigid_scene.astype(np.float32).reshape(1, 4, 2), M_pad
+                ).reshape(4, 2).astype(np.float64)
+
+        if cand_pad is None and all(len(p) >= 12 for p in pts_list):
             h_lines = [_fit_line_huber(p) for p in pts_list]
             if all(l is not None for l in h_lines):
                 inter_pts = []

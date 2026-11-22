@@ -375,10 +375,10 @@ def _render_visual_board(
     plt.close(fig)
 
 
-def _summarize_errs(errs: list[float], ious: list[float]) -> dict[str, float]:
+def _summarize_errs(errs: list[float], ious: list[float], clips: Optional[list[float]] = None) -> dict[str, float]:
     ea = np.asarray(errs, dtype=np.float64)
     ia = np.asarray(ious, dtype=np.float64)
-    return {
+    res = {
         "n": int(len(ea)),
         "mean_px": round(float(np.mean(ea)), 4),
         "median_px": round(float(np.median(ea)), 4),
@@ -388,6 +388,10 @@ def _summarize_errs(errs: list[float], ious: list[float]) -> dict[str, float]:
         "pct_lt_3px": round(float((ea <= 3.0).mean() * 100.0), 2),
         "mask_iou_mean": round(float(np.mean(ia)), 5),
     }
+    if clips:
+        res["border_clip_pct_mean"] = round(float(np.mean(clips)), 3)
+        res["border_clip_pct_p90"] = round(float(np.percentile(clips, 90)), 3)
+    return res
 
 
 def _plot_summary(
@@ -511,6 +515,7 @@ def main() -> None:
 
     synth_obb_errs: dict[str, list[float]] = {"Raw OBB": [], "OBB + Legacy PBL": [], "OBB + 2-Pass Edge Snap + AA": []}
     synth_obb_ious: dict[str, list[float]] = {k: [] for k in synth_obb_errs}
+    synth_obb_clips: dict[str, list[float]] = {k: [] for k in synth_obb_errs}
     synth_seg_errs: dict[str, list[float]] = {
         "Mask -> minAreaRect": [],
         "Mask -> Legacy Binary Fit": [],
@@ -518,6 +523,7 @@ def main() -> None:
         "Mask -> Upgraded + 2-Pass Snap": [],
     }
     synth_seg_ious: dict[str, list[float]] = {k: [] for k in synth_seg_errs}
+    synth_seg_clips: dict[str, list[float]] = {k: [] for k in synth_seg_errs}
 
     logger.info("Running same-proposal synthetic benchmark on %d scenes...", len(chosen))
     for p in chosen:
@@ -529,6 +535,9 @@ def main() -> None:
             continue
         gt_q = order_quad(gt_quads[0])
         gt_m = gt_masks[0]
+        gt_u8 = (gt_m > 0.5).astype(np.uint8)
+        gt_ring = (gt_u8 - cv2.erode(gt_u8, np.ones((9, 9), np.uint8))) > 0
+        ring_area = max(float(gt_ring.sum()), 1.0)
 
         # Track A: single raw OBB proposal shared across A1..A3
         det_obb.use_pbl = False
@@ -544,6 +553,8 @@ def main() -> None:
                 inter = float(np.logical_and(proj_m > 0.5, gt_m > 0.5).sum())
                 union = float(np.logical_or(proj_m > 0.5, gt_m > 0.5).sum())
                 synth_obb_ious[k].append(inter / union if union > 0 else 0.0)
+                clipped = float(np.logical_and(gt_ring, ~(proj_m > 0.5)).sum())
+                synth_obb_clips[k].append(clipped / ring_area * 100.0)
 
         # Track B: single raw YOLO11-Seg probability map shared across B1..B4
         prob_mask = _extract_raw_yolo_seg_prob(det_seg, img_bgr)
@@ -557,6 +568,8 @@ def main() -> None:
                     inter = float(np.logical_and(proj_m > 0.5, gt_m > 0.5).sum())
                     union = float(np.logical_or(proj_m > 0.5, gt_m > 0.5).sum())
                     synth_seg_ious[k].append(inter / union if union > 0 else 0.0)
+                    clipped = float(np.logical_and(gt_ring, ~(proj_m > 0.5)).sum())
+                    synth_seg_clips[k].append(clipped / ring_area * 100.0)
 
     # ------------------------------------------------------------------
     # 2. Real smartphone captures (same proposal + visual boards + NCC)
@@ -635,8 +648,8 @@ def main() -> None:
                 )
 
     synth_summary = {
-        "track_a_same_obb": {k: _summarize_errs(synth_obb_errs[k], synth_obb_ious[k]) for k in synth_obb_errs},
-        "track_b_same_seg_mask": {k: _summarize_errs(synth_seg_errs[k], synth_seg_ious[k]) for k in synth_seg_errs},
+        "track_a_same_obb": {k: _summarize_errs(synth_obb_errs[k], synth_obb_ious[k], synth_obb_clips[k]) for k in synth_obb_errs},
+        "track_b_same_seg_mask": {k: _summarize_errs(synth_seg_errs[k], synth_seg_ious[k], synth_seg_clips[k]) for k in synth_seg_errs},
     }
     wilcoxon_tests = {
         "track_a_edge_snap_vs_raw_obb_p": float(

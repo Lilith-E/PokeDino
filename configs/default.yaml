@@ -46,6 +46,8 @@ detector:
     search_band_frac: 0.06      # Search corridor half-width as fraction of canonical short side
     dp_smoothness_weight: 0.35  # 1D Dynamic Programming seam continuity weight
     aspect_prior_weight: 0.15   # Soft projective 88:63 aspect-ratio regularization weight
+    outer_ramp_anchor: true     # Anchor seam to outward half-max slope to avoid border clipping
+    rigid_6dof_pose: true       # Constrain quad to exact 3D 63x88 planar perspective pose
     antialiased_warp: true      # Mipmap/Gaussian pre-filter before warpPerspective when downsampling
 
 segmentation:
