@@ -41,8 +41,11 @@ detector:
     ransac_iters: 120
     erode_mask_px: 2            # Slight inward erosion of warped mask to suppress border bleed
     feather_px: 3
-    refine_edges: true          # Snap segmentation borders to full-res Sobel + Lab gradients
-    refine_iters: 2             # Iterative canonical edge-snap passes (coarse + sub-pixel fine)
+    refine_edges: true          # Snap proposals/masks to contrast-normalized image boundary energy
+    refine_iters: 2             # Coarse-to-fine canonical refinement passes
+    search_band_frac: 0.06      # Search corridor half-width as fraction of canonical short side
+    dp_smoothness_weight: 0.35  # 1D Dynamic Programming seam continuity weight
+    aspect_prior_weight: 0.15   # Soft projective 88:63 aspect-ratio regularization weight
     antialiased_warp: true      # Mipmap/Gaussian pre-filter before warpPerspective when downsampling
 
 segmentation:

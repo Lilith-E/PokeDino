@@ -626,25 +626,264 @@ def warp_perspective_antialiased(
     return cv2.warpPerspective(roi, M_eff, dsize, flags=flags, borderMode=border_mode)
 
 
-def _refine_quad_from_image_edges(
+def _compute_normalized_boundary_energy(
+    patch_bgr: np.ndarray,
+    pad: int,
+    target_w: int,
+    target_h: int,
+    band_px: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute contrast-normalized directional boundary energy (ey, ex) in [0, 1].
+
+    Combines multi-scale Sobel + CIE-Lab gradients with signed outer-vs-inner Lab
+    step contrast, normalized per image by robust MAD statistics inside the border band
+    so no hardcoded intensity or gradient thresholds are required.
+    """
+    h_pad, w_pad = patch_bgr.shape[:2]
+    lab = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab_s1 = cv2.GaussianBlur(lab, (3, 3), 0.7)
+    lab_s2 = cv2.GaussianBlur(lab, (5, 5), 1.4)
+
+    def _dir_grad(arr: np.ndarray, dx: int, dy: int) -> np.ndarray:
+        gL = np.abs(cv2.Sobel(arr[:, :, 0], cv2.CV_32F, dx, dy, ksize=3))
+        ga = np.abs(cv2.Sobel(arr[:, :, 1], cv2.CV_32F, dx, dy, ksize=3))
+        gb = np.abs(cv2.Sobel(arr[:, :, 2], cv2.CV_32F, dx, dy, ksize=3))
+        return 0.65 * gL + 0.35 * np.sqrt(ga * ga + gb * gb)
+
+    gy_raw = 0.6 * _dir_grad(lab_s1, 0, 1) + 0.4 * _dir_grad(lab_s2, 0, 1)
+    gx_raw = 0.6 * _dir_grad(lab_s1, 1, 0) + 0.4 * _dir_grad(lab_s2, 1, 0)
+
+    # Outer-vs-inner color-step contrast over ±step_off pixels across each edge normal.
+    step_off = max(3, int(round(0.012 * target_w)))
+    step_y = np.zeros((h_pad, w_pad), dtype=np.float32)
+    step_x = np.zeros((h_pad, w_pad), dtype=np.float32)
+    if h_pad > 2 * step_off:
+        diff_y = np.linalg.norm(lab_s1[2 * step_off :, :, :] - lab_s1[: h_pad - 2 * step_off, :, :], axis=2)
+        step_y[step_off : h_pad - step_off, :] = diff_y
+    if w_pad > 2 * step_off:
+        diff_x = np.linalg.norm(lab_s1[:, 2 * step_off :, :] - lab_s1[:, : w_pad - 2 * step_off, :], axis=2)
+        step_x[:, step_off : w_pad - step_off] = diff_x
+
+    # Normalize relative to robust MAD statistics inside the candidate border band.
+    rim_mask = np.zeros((h_pad, w_pad), dtype=bool)
+    b = max(band_px, 4)
+    rim_mask[max(0, pad - b) : min(h_pad, pad + b + 1), pad : pad + target_w] = True
+    rim_mask[max(0, pad + target_h - 1 - b) : min(h_pad, pad + target_h + b), pad : pad + target_w] = True
+    rim_mask[pad : pad + target_h, max(0, pad - b) : min(w_pad, pad + b + 1)] = True
+    rim_mask[pad : pad + target_h, max(0, pad + target_w - 1 - b) : min(w_pad, pad + target_w + b)] = True
+
+    def _norm_map(grad: np.ndarray, step: np.ndarray) -> np.ndarray:
+        vals_g = grad[rim_mask]
+        med_g = float(np.median(vals_g)) if vals_g.size else 1.0
+        mad_g = float(np.median(np.abs(vals_g - med_g))) if vals_g.size else 1.0
+        scale_g = max(med_g + 1.4826 * mad_g, 1.0)
+        e_g = np.tanh(grad / (2.0 * scale_g))
+
+        vals_s = step[rim_mask]
+        med_s = float(np.median(vals_s)) if vals_s.size else 1.0
+        mad_s = float(np.median(np.abs(vals_s - med_s))) if vals_s.size else 1.0
+        scale_s = max(med_s + 1.4826 * mad_s, 1.0)
+        e_s = np.tanh(step / (1.8 * scale_s))
+        # Step-boundary gating: genuine card edges separate two distinct regions (high e_s),
+        # whereas thin interior printed frames have near-identical color on both sides (low e_s).
+        return np.clip(e_g * (0.25 + 0.75 * e_s), 0.0, 1.0).astype(np.float32)
+
+    return _norm_map(gy_raw, step_y), _norm_map(gx_raw, step_x)
+
+
+def _extract_dp_edge_seam(
+    energy_strip: np.ndarray,
+    offsets: np.ndarray,
+    smoothness_weight: float = 0.35,
+    prior_weight: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find optimal continuous seam across N scanlines using exact O(N*M) L1 Viterbi DP."""
+    n_rays, n_off = energy_strip.shape
+    if n_rays == 0 or n_off == 0:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+
+    max_abs_off = max(float(np.max(np.abs(offsets))), 1.0)
+    data_cost = -energy_strip.astype(np.float64) + prior_weight * (np.abs(offsets)[None, :] / max_abs_off)
+    alpha = float(smoothness_weight) / max(1.0, 0.12 * float(n_off))
+
+    dp = np.empty_like(data_cost)
+    back = np.zeros((n_rays, n_off), dtype=np.int32)
+    dp[0] = data_cost[0]
+
+    # Exact linear-time L1 distance transform per row: min_j (prev[j] + alpha * |i - j|)
+    for r in range(1, n_rays):
+        prev = dp[r - 1].copy()
+        idx_src = np.arange(n_off, dtype=np.int32)
+
+        # Forward pass
+        for j in range(1, n_off):
+            cand = prev[j - 1] + alpha
+            if cand < prev[j]:
+                prev[j] = cand
+                idx_src[j] = idx_src[j - 1]
+        # Backward pass
+        for j in range(n_off - 2, -1, -1):
+            cand = prev[j + 1] + alpha
+            if cand < prev[j]:
+                prev[j] = cand
+                idx_src[j] = idx_src[j + 1]
+
+        dp[r] = data_cost[r] + prev
+        back[r] = idx_src
+
+    path = np.empty(n_rays, dtype=np.int32)
+    path[-1] = int(np.argmin(dp[-1]))
+    for r in range(n_rays - 2, -1, -1):
+        path[r] = back[r + 1, path[r + 1]]
+
+    sub_offsets = np.empty(n_rays, dtype=np.float64)
+    confs = np.empty(n_rays, dtype=np.float64)
+    for r in range(n_rays):
+        idx = int(path[r])
+        sub_idx = _subpixel_peak_1d(energy_strip[r], idx)
+        lo_i = max(0, min(n_off - 2, int(np.floor(sub_idx))))
+        frac = sub_idx - float(lo_i)
+        sub_offsets[r] = float(offsets[lo_i] + frac * (offsets[lo_i + 1] - offsets[lo_i]))
+        confs[r] = float(energy_strip[r, idx])
+    return sub_offsets, confs
+
+
+def _fit_joint_projective_quad(
+    side_pts: list[np.ndarray],
+    side_weights: list[np.ndarray],
+    nom_quad: np.ndarray,
+    aspect_prior_weight: float = 0.15,
+    huber_delta: float = 2.0,
+    n_iters: int = 8,
+) -> np.ndarray:
+    """Simultaneously fit all 4 card corners via Huber-IRLS on the 88:63 projective manifold.
+
+    Couples all four edges with a soft planar aspect-ratio prior so heavily occluded or
+    noisy sides are constrained by projective geometry without parallel-edge assumptions.
+    """
+    q = np.asarray(nom_quad, dtype=np.float64).reshape(8).copy()
+    q_anchor = q.copy()
+
+    w_nom = float(np.linalg.norm(nom_quad[1] - nom_quad[0]))
+    h_nom = float(np.linalg.norm(nom_quad[3] - nom_quad[0]))
+    target_ar = h_nom / max(w_nom, 1.0)
+
+    pts_all = [np.asarray(p, dtype=np.float64) for p in side_pts]
+    wts_all = [np.asarray(w, dtype=np.float64) for w in side_weights]
+    total_pts = sum(len(p) for p in pts_all)
+    if total_pts < 12:
+        return nom_quad.copy()
+
+    def _residuals(qv: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        qp = qv.reshape(4, 2)
+        res_list: list[np.ndarray] = []
+        base_w: list[np.ndarray] = []
+        for s in range(4):
+            pts = pts_all[s]
+            if len(pts) == 0:
+                continue
+            pa = qp[s]
+            pb = qp[(s + 1) % 4]
+            edge = pb - pa
+            elen = max(float(np.linalg.norm(edge)), 1e-6)
+            # Signed perpendicular distance to edge segment s
+            n_vec = np.array([-edge[1] / elen, edge[0] / elen], dtype=np.float64)
+            d = (pts - pa[None, :]) @ n_vec
+            res_list.append(d)
+            base_w.append(wts_all[s])
+
+        if not res_list:
+            return np.zeros(1, dtype=np.float64), np.ones(1, dtype=np.float64)
+
+        r_data = np.concatenate(res_list)
+        w_data = np.concatenate(base_w)
+        # Huber IRLS weight on geometric edge distances
+        abs_d = np.abs(r_data)
+        huber_w = np.where(abs_d <= huber_delta, 1.0, huber_delta / np.maximum(abs_d, 1e-6))
+        w_eff = w_data * huber_w
+
+        # Soft projective 88:63 aspect-ratio prior
+        w_avg = 0.5 * (float(np.linalg.norm(qp[1] - qp[0])) + float(np.linalg.norm(qp[2] - qp[3])))
+        h_avg = 0.5 * (float(np.linalg.norm(qp[3] - qp[0])) + float(np.linalg.norm(qp[2] - qp[1])))
+        r_ar = ((h_avg / max(w_avg, 1.0)) - target_ar) * w_nom
+        w_ar = float(aspect_prior_weight) * max(float(np.sum(w_data)), 1.0)
+
+        # Mild nullspace anchor toward initial quad for completely unobserved degrees of freedom
+        r_anc = (qv - q_anchor) * 0.05
+        w_anc = np.full(8, 0.08 * max(float(np.mean(w_data)), 0.1), dtype=np.float64)
+
+        r_full = np.concatenate([r_data, np.array([r_ar], dtype=np.float64), r_anc])
+        w_full = np.concatenate([w_eff, np.array([w_ar], dtype=np.float64), w_anc])
+        return r_full, w_full
+
+    eps = 1e-3
+    for _ in range(n_iters):
+        r0, w0 = _residuals(q)
+        sqrt_w = np.sqrt(np.maximum(w0, 0.0))
+        rw0 = r0 * sqrt_w
+        cost0 = float(np.dot(rw0, rw0))
+
+        J = np.empty((len(r0), 8), dtype=np.float64)
+        for j in range(8):
+            qp = q.copy()
+            qp[j] += eps
+            rp, _ = _residuals(qp)
+            J[:, j] = ((rp - r0) / eps) * sqrt_w
+
+        J = np.where(np.abs(J) < 1e-12, 0.0, J)
+        rw0_c = np.where(np.abs(rw0) < 1e-12, 0.0, rw0)
+        JTJ = np.einsum("ni,nj->ij", J, J) + 1e-4 * np.eye(8)
+        JTr = np.einsum("ni,n->i", J, rw0_c)
+        try:
+            dq = -np.linalg.solve(JTJ, JTr)
+        except np.linalg.LinAlgError:
+            break
+
+        if not np.all(np.isfinite(dq)):
+            break
+
+        step_norm = float(np.linalg.norm(dq))
+        if step_norm < 1e-3:
+            break
+
+        # Backtracking line search
+        accepted = False
+        for alpha in (1.0, 0.5, 0.25, 0.1):
+            q_try = q + alpha * dq
+            r_try, _ = _residuals(q_try)
+            cost_try = float(np.dot(r_try * sqrt_w, r_try * sqrt_w))
+            if cost_try < cost0:
+                q = q_try
+                accepted = True
+                break
+        if not accepted:
+            break
+
+    return q.reshape(4, 2)
+
+
+def refine_card_quad(
     img_bgr: np.ndarray,
     quad: np.ndarray,
-    mask: np.ndarray,
+    mask: Optional[np.ndarray] = None,
     target_size: tuple[int, int] = (TARGET_H, TARGET_W),
-    pad: int = 36,
-    band_out: int = 10,
-    band_in: int = 12,
-    n_samples: int = 72,
+    search_band_frac: float = 0.06,
+    dp_smoothness_weight: float = 0.35,
+    aspect_prior_weight: float = 0.15,
+    corner_excl_frac: float = 0.14,
+    n_samples: int = 80,
     n_iters: int = 2,
 ) -> np.ndarray:
-    """Snap segmentation-derived card edges to full-resolution physical image gradients.
+    """Refine any initial card quadrilateral using scale-invariant boundary DP + joint IRLS.
 
-    Runs multi-pass canonical alignment (coarse then tight fine polish) using proximity-prior
-    weighted directional Sobel + CIE-Lab chromatic gradients with parabolic 3-point sub-pixel
-    peak interpolation, RANSAC line fitting, and span/keystone consistency gates.
+    Completely backend-agnostic (works identically for raw OBB boxes and segmentation masks),
+    resolution-independent (all spatial windows scale with canonical card size), and gated
+    strictly by a contrast-normalized boundary-alignment objective.
     """
     q_cur = order_quad(quad)
     target_h, target_w = target_size
+    base_band = max(10, int(round(search_band_frac * float(min(target_w, target_h)))))
+    pad = max(24, int(round(base_band * 1.6)))
     w_pad = target_w + 2 * pad
     h_pad = target_h + 2 * pad
     dst_pad = np.array(
@@ -656,13 +895,90 @@ def _refine_quad_from_image_edges(
         ],
         dtype=np.float32,
     )
-    mask_f = (mask > 0.5).astype(np.float32)
+    nom_pad = dst_pad.astype(np.float64)
+
+    mask_f: Optional[np.ndarray] = None
+    has_shaped_mask = False
+    if mask is not None and mask.size > 0:
+        mask_f = mask.astype(np.float32)
+        if mask_f.max() > 1.0:
+            mask_f = mask_f / 255.0
+        # Detect whether mask provides informative foreground contours vs uniform quad fill
+        frac_fg = float((mask_f >= 0.5).mean())
+        has_shaped_mask = 0.02 < frac_fg < 0.92
+
+    lo_t = float(np.clip(corner_excl_frac, 0.06, 0.25))
+    ts = np.linspace(lo_t, 1.0 - lo_t, n_samples, dtype=np.float64)
+
+    def _sample_strip_energy(ey: np.ndarray, ex: np.ndarray, q_box: np.ndarray, offsets: np.ndarray) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        ctr = q_box.mean(axis=0)
+        pts_list: list[np.ndarray] = []
+        wts_list: list[np.ndarray] = []
+        for s in range(4):
+            p1, p2 = q_box[s], q_box[(s + 1) % 4]
+            edge = p2 - p1
+            elen = max(float(np.linalg.norm(edge)), 1.0)
+            n_in = np.array([-edge[1] / elen, edge[0] / elen], dtype=np.float64)
+            if float(np.dot(ctr - 0.5 * (p1 + p2), n_in)) < 0.0:
+                n_in = -n_in
+            bases = p1[None, :] + ts[:, None] * edge[None, :]
+            gx = (bases[:, 0:1] + offsets[None, :] * n_in[0]).astype(np.float32)
+            gy = (bases[:, 1:2] + offsets[None, :] * n_in[1]).astype(np.float32)
+            emap = ey if s in (0, 2) else ex
+            strip = cv2.remap(emap, gx, gy, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+            sub_off, confs = _extract_dp_edge_seam(strip, offsets, smoothness_weight=dp_smoothness_weight)
+            if len(sub_off) == 0:
+                pts_list.append(np.empty((0, 2), dtype=np.float64))
+                wts_list.append(np.empty(0, dtype=np.float64))
+                continue
+            # Keep samples above local noise floor and reject isolated normal spikes via MAD
+            floor = max(float(np.percentile(confs, 20)) * 0.8, 0.08)
+            valid = confs >= floor
+            if valid.sum() >= 8:
+                off_v = sub_off[valid]
+                med_o = float(np.median(off_v))
+                mad_o = max(float(np.median(np.abs(off_v - med_o))), 0.8)
+                valid = valid & (np.abs(sub_off - med_o) <= 2.6 * mad_o)
+            if valid.sum() < 6:
+                valid = np.ones_like(confs, dtype=bool)
+            pts_s = bases[valid] + sub_off[valid, None] * n_in[None, :]
+            wts_s = np.square(confs[valid])
+            # Filter out localized DP excursions via scale-adaptive RANSAC line consensus
+            if len(pts_s) >= 12:
+                r_line = _fit_line_ransac(pts_s, thresh_px=2.0, n_iters=60)
+                if r_line is not None:
+                    ra, rb, rc = r_line
+                    r_dists = np.abs(pts_s[:, 0] * ra + pts_s[:, 1] * rb + rc)
+                    inl_r = r_dists <= 2.2
+                    if inl_r.sum() >= 8:
+                        pts_s = pts_s[inl_r]
+                        wts_s = wts_s[inl_r]
+            pts_list.append(pts_s)
+            wts_list.append(wts_s)
+        return pts_list, wts_list
+
+    def _eval_quad_energy(ey: np.ndarray, ex: np.ndarray, q_box: np.ndarray) -> float:
+        scores: list[float] = []
+        for s in range(4):
+            p1, p2 = q_box[s], q_box[(s + 1) % 4]
+            pts = p1[None, :] + ts[:, None] * (p2 - p1)[None, :]
+            emap = ey if s in (0, 2) else ex
+            vals = cv2.remap(
+                emap,
+                pts[:, 0:1].astype(np.float32),
+                pts[:, 1:2].astype(np.float32),
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0.0,
+            )
+            scores.append(float(np.mean(vals)))
+        return float(np.mean(scores))
 
     n_passes = max(1, int(n_iters))
     for p_idx in range(n_passes):
-        b_out = band_out if p_idx == 0 else max(4, min(6, band_out))
-        b_in = band_in if p_idx == 0 else max(4, min(6, band_in))
-        sigma_prior = 5.5 if p_idx == 0 else 3.2
+        b_out = base_band if p_idx == 0 else max(5, int(round(0.35 * base_band)))
+        b_in = max(4, int(round(0.48 * b_out)))
+        offsets = np.arange(-b_out, b_in + 1, dtype=np.float64)
 
         try:
             M_pad = cv2.getPerspectiveTransform(q_cur.astype(np.float32), dst_pad)
@@ -673,123 +989,56 @@ def _refine_quad_from_image_edges(
         patch_bgr = cv2.warpPerspective(
             img_bgr, M_pad, (w_pad, h_pad), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
         )
-        mask_pad = cv2.warpPerspective(
-            mask_f, M_pad, (w_pad, h_pad), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0
-        )
+        ey, ex = _compute_normalized_boundary_energy(patch_bgr, pad, target_w, target_h, b_out)
 
-        lab = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-        L_blur = cv2.GaussianBlur(lab[:, :, 0], (3, 3), 0)
-        a_blur = cv2.GaussianBlur(lab[:, :, 1], (3, 3), 0)
-        b_blur = cv2.GaussianBlur(lab[:, :, 2], (3, 3), 0)
+        # Smooth mask-boundary coherence: peaks at mask ≈ 0.5, suppressing interior printed frames
+        if mask_f is not None and has_shaped_mask:
+            mask_pad = cv2.warpPerspective(
+                mask_f, M_pad, (w_pad, h_pad), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0
+            )
+            trans_env = np.exp(-0.5 * ((mask_pad - 0.5) / 0.28) ** 2).astype(np.float32)
+            trans_env = np.clip(0.15 + 0.85 * trans_env, 0.15, 1.0)
+            ey = ey * trans_env
+            ex = ex * trans_env
 
-        gy = (
-            np.abs(cv2.Sobel(L_blur, cv2.CV_32F, 0, 1, ksize=3))
-            + 0.7 * np.abs(cv2.Sobel(a_blur, cv2.CV_32F, 0, 1, ksize=3))
-            + 0.7 * np.abs(cv2.Sobel(b_blur, cv2.CV_32F, 0, 1, ksize=3))
-        )
-        gx = (
-            np.abs(cv2.Sobel(L_blur, cv2.CV_32F, 1, 0, ksize=3))
-            + 0.7 * np.abs(cv2.Sobel(a_blur, cv2.CV_32F, 1, 0, ksize=3))
-            + 0.7 * np.abs(cv2.Sobel(b_blur, cv2.CV_32F, 1, 0, ksize=3))
-        )
+        pts_list, wts_list = _sample_strip_energy(ey, ex, nom_pad, offsets)
 
-        def _sample_side(mag: np.ndarray, expected: int, axis: str, s_out: int, s_in: int) -> np.ndarray:
-            pts = []
-            lo_idx = max(2, expected - s_out)
-            hi_idx = min((h_pad - 3) if axis == "h" else (w_pad - 3), expected + s_in)
-            if hi_idx <= lo_idx + 2:
-                return np.empty((0, 2), dtype=np.float64)
-            dists = np.arange(lo_idx, hi_idx, dtype=np.float32) - float(expected)
-            prior = np.exp(-0.5 * (dists / sigma_prior) ** 2)
+        # Exact closed-form Huber line intersection when all 4 edges have strong inlier support;
+        # otherwise solve jointly on the 88:63 projective manifold via Huber-IRLS.
+        cand_pad: Optional[np.ndarray] = None
+        if all(len(p) >= 12 for p in pts_list):
+            h_lines = [_fit_line_huber(p) for p in pts_list]
+            if all(l is not None for l in h_lines):
+                inter_pts = []
+                for idx_l in range(4):
+                    pt = _intersect_lines(h_lines[(idx_l - 1) % 4], h_lines[idx_l])
+                    if pt is None or not np.isfinite(pt).all():
+                        inter_pts = []
+                        break
+                    inter_pts.append(pt)
+                if len(inter_pts) == 4:
+                    cand_pad = np.asarray(inter_pts, dtype=np.float64)
 
-            for t in np.linspace(0.14, 0.86, n_samples):
-                if axis == "h":
-                    x = int(pad + t * (target_w - 1))
-                    inner_y = min(h_pad - 1, max(0, expected + (18 if expected < h_pad // 2 else -18)))
-                    if mask_pad[inner_y, x] < 0.5:
-                        continue
-                    col = mag[lo_idx:hi_idx, x]
-                    if len(col) == 0:
-                        continue
-                    weighted = col * prior
-                    idx_max = int(np.argmax(weighted))
-                    if float(col[idx_max]) > 18.0:
-                        sub_y = float(lo_idx) + _subpixel_peak_1d(col, idx_max)
-                        pts.append([float(x), sub_y])
-                else:
-                    y = int(pad + t * (target_h - 1))
-                    inner_x = min(w_pad - 1, max(0, expected + (18 if expected < w_pad // 2 else -18)))
-                    if mask_pad[y, inner_x] < 0.5:
-                        continue
-                    row = mag[y, lo_idx:hi_idx]
-                    if len(row) == 0:
-                        continue
-                    weighted = row * prior
-                    idx_max = int(np.argmax(weighted))
-                    if float(row[idx_max]) > 18.0:
-                        sub_x = float(lo_idx) + _subpixel_peak_1d(row, idx_max)
-                        pts.append([sub_x, float(y)])
-            return np.asarray(pts, dtype=np.float64) if pts else np.empty((0, 2), dtype=np.float64)
+        if cand_pad is None or not _is_convex_quad(cand_pad) or not _opposite_taper_ok(cand_pad, max_ratio=1.24):
+            cand_pad = _fit_joint_projective_quad(
+                pts_list,
+                wts_list,
+                nom_pad,
+                aspect_prior_weight=aspect_prior_weight,
+            )
 
-        def _mad_clean(pts: np.ndarray, axis_idx: int) -> np.ndarray:
-            if len(pts) < 10:
-                return pts
-            vals = pts[:, axis_idx]
-            med = float(np.median(vals))
-            mad = max(float(np.median(np.abs(vals - med))), 0.8)
-            return pts[np.abs(vals - med) <= 2.8 * mad]
-
-        top_pts = _mad_clean(_sample_side(gy, pad, "h", b_out, b_in), 1)
-        bot_pts = _mad_clean(_sample_side(gy, pad + target_h - 1, "h", b_in, b_out), 1)
-        left_pts = _mad_clean(_sample_side(gx, pad, "v", b_out, b_in), 0)
-        right_pts = _mad_clean(_sample_side(gx, pad + target_w - 1, "v", b_in, b_out), 0)
-
-        def _canonical_line(axis: str, pos: int) -> tuple[float, float, float]:
-            return (0.0, 1.0, -float(pos)) if axis == "h" else (1.0, 0.0, -float(pos))
-
-        def _fit_or_default(
-            pts: np.ndarray,
-            axis: str,
-            default_pos: int,
-            seg_len: float,
-            max_tilt_rad: float = 0.11,
-        ) -> tuple[float, float, float]:
-            if len(pts) < 14:
-                return _canonical_line(axis, default_pos)
-            line = _fit_line_ransac(pts, thresh_px=1.6, n_iters=90)
-            if line is None:
-                return _canonical_line(axis, default_pos)
-            a, b, _ = line
-            if axis == "h" and abs(a) > max_tilt_rad:
-                return _canonical_line(axis, default_pos)
-            if axis == "v" and abs(b) > max_tilt_rad:
-                return _canonical_line(axis, default_pos)
-            # Require broad edge coverage so localized inner borders cannot tilt the side
-            span_axis = pts[:, 0] if axis == "h" else pts[:, 1]
-            dists = np.abs(pts[:, 0] * a + pts[:, 1] * b + line[2])
-            inl = span_axis[dists <= 2.0]
-            if len(inl) < 10 or float(inl.max() - inl.min()) < 0.30 * seg_len:
-                return _canonical_line(axis, default_pos)
-            return line
-
-        l_top = _fit_or_default(top_pts, "h", pad, float(target_w))
-        l_right = _fit_or_default(right_pts, "v", pad + target_w - 1, float(target_h))
-        l_bot = _fit_or_default(bot_pts, "h", pad + target_h - 1, float(target_w))
-        l_left = _fit_or_default(left_pts, "v", pad, float(target_h))
-
-        corners_pad = []
-        ok_inter = True
-        for l1, l2 in ((l_top, l_left), (l_top, l_right), (l_bot, l_right), (l_bot, l_left)):
-            pt = _intersect_lines(l1, l2)
-            if pt is None or not np.isfinite(pt).all():
-                ok_inter = False
-                break
-            corners_pad.append(pt)
-        if not ok_inter:
+        if not _is_convex_quad(cand_pad) or not _opposite_taper_ok(cand_pad, max_ratio=1.24):
             break
 
-        cand_pad = np.asarray(corners_pad, dtype=np.float64)
-        if not _is_convex_quad(cand_pad) or not _opposite_taper_ok(cand_pad, max_ratio=1.24):
+        area_nom = abs(float(cv2.contourArea(nom_pad.astype(np.float32))))
+        area_cand = abs(float(cv2.contourArea(cand_pad.astype(np.float32))))
+        if area_nom > 0 and not (0.82 <= area_cand / area_nom <= 1.18):
+            break
+
+        # Objective-gated acceptance: keep refinement iff normalized boundary alignment strictly improves
+        e_before = _eval_quad_energy(ey, ex, nom_pad)
+        e_after = _eval_quad_energy(ey, ex, cand_pad)
+        if e_after <= e_before + 1e-4:
             break
 
         refined_scene = cv2.perspectiveTransform(
@@ -801,16 +1050,35 @@ def _refine_quad_from_image_edges(
         if min(rw, rh) < 20:
             break
         ar = max(rw, rh) / max(min(rw, rh), 1e-3)
-        if not (1.18 <= ar <= 1.62):
-            break
-
-        shift_mean = float(np.linalg.norm(refined_scene - q_cur, axis=1).mean())
-        if shift_mean > max(16.0, 0.04 * max(rw, rh)):
+        if not (1.12 <= ar <= 1.72):
             break
 
         q_cur = order_quad(refined_scene)
 
     return q_cur
+
+
+def _refine_quad_from_image_edges(
+    img_bgr: np.ndarray,
+    quad: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+    target_size: tuple[int, int] = (TARGET_H, TARGET_W),
+    n_iters: int = 2,
+    search_band_frac: float = 0.06,
+    dp_smoothness_weight: float = 0.35,
+    aspect_prior_weight: float = 0.15,
+) -> np.ndarray:
+    """Backward-compatible alias delegating to the unified generalizable refine_card_quad."""
+    return refine_card_quad(
+        img_bgr=img_bgr,
+        quad=quad,
+        mask=mask,
+        target_size=target_size,
+        search_band_frac=search_band_frac,
+        dp_smoothness_weight=dp_smoothness_weight,
+        aspect_prior_weight=aspect_prior_weight,
+        n_iters=n_iters,
+    )
 
 
 def rectify_from_mask(
@@ -829,6 +1097,9 @@ def rectify_from_mask(
     antialiased_warp: bool = True,
     min_span_frac: float = 0.30,
     max_side_tilt_rad: float = 0.20,
+    search_band_frac: float = 0.06,
+    dp_smoothness_weight: float = 0.35,
+    aspect_prior_weight: float = 0.15,
 ) -> Optional[RectifiedCard]:
     """Rectify an image and its segmentation mask into canonical upright coordinates."""
     quad = fit_quad_from_mask(
@@ -844,8 +1115,16 @@ def rectify_from_mask(
     if quad is None:
         return None
     if refine_edges:
-        quad = _refine_quad_from_image_edges(
-            img_bgr, quad, mask, target_size=target_size, n_iters=refine_iters
+        quad = refine_card_quad(
+            img_bgr,
+            quad,
+            mask=mask,
+            target_size=target_size,
+            search_band_frac=search_band_frac,
+            dp_smoothness_weight=dp_smoothness_weight,
+            aspect_prior_weight=aspect_prior_weight,
+            corner_excl_frac=corner_excl_frac,
+            n_iters=refine_iters,
         )
 
     rect = cv2.minAreaRect(quad.astype(np.float32))

@@ -151,6 +151,9 @@ class SegmentationCardDetector:
             rect_cfg.get("refine_edges", True) if refine_edges is None else refine_edges
         )
         self.refine_iters = int(rect_cfg.get("refine_iters", 2))
+        self.search_band_frac = float(rect_cfg.get("search_band_frac", 0.06))
+        self.dp_smoothness_weight = float(rect_cfg.get("dp_smoothness_weight", 0.35))
+        self.aspect_prior_weight = float(rect_cfg.get("aspect_prior_weight", 0.15))
         self.antialiased_warp = bool(rect_cfg.get("antialiased_warp", True))
         self.crop_refine = False
 
@@ -239,6 +242,9 @@ class SegmentationCardDetector:
             antialiased_warp=self.antialiased_warp,
             min_span_frac=self.min_span_frac,
             max_side_tilt_rad=self.max_side_tilt_rad,
+            search_band_frac=self.search_band_frac,
+            dp_smoothness_weight=self.dp_smoothness_weight,
+            aspect_prior_weight=self.aspect_prior_weight,
         )
         if res is None:
             return None

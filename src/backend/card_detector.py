@@ -13,7 +13,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from backend.rectifier import _subpixel_peak_1d, warp_perspective_antialiased
+from backend.rectifier import _subpixel_peak_1d, refine_card_quad, warp_perspective_antialiased
 
 logger = logging.getLogger(__name__)
 
@@ -687,9 +687,15 @@ class CardDetector:
             return None, q
 
     def _refine_warp(self, img_bgr: np.ndarray, corners: np.ndarray):
-        """Snap the quad to edge evidence only when the correction stays within 5 px."""
-        patch, refined_corners = self._refine_quad_lines(img_bgr, corners)
-        if patch is not None and self._quad_distance(refined_corners, corners) <= 6.5:
+        """Refine OBB quadrilateral using unified scale-invariant boundary DP + joint IRLS."""
+        refined_corners = refine_card_quad(
+            img_bgr=img_bgr,
+            quad=corners,
+            mask=None,
+            target_size=(self.target_h, self.target_w),
+        )
+        patch = self.warp_card(img_bgr, refined_corners)
+        if patch is not None:
             return patch, refined_corners
         return self.warp_card(img_bgr, corners), corners
 
