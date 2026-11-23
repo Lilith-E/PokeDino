@@ -128,9 +128,6 @@ class _ConvBlock(nn.Module):
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.SiLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.SiLU(inplace=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -138,7 +135,7 @@ class _ConvBlock(nn.Module):
 
 
 class CornerHeatmapUNet(nn.Module):
-    """MobileNetV3-Large U-Net predicting 4 corner heatmaps + 1 auxiliary card mask."""
+    """Lean MobileNetV3-Large U-Net predicting 4 corner heatmaps + 1 auxiliary card mask."""
 
     def __init__(self, pretrained: bool = True):
         super().__init__()
@@ -152,9 +149,10 @@ class CornerHeatmapUNet(nn.Module):
         self.enc4 = feats[7:13]  # stride 16, 112 ch
         self.enc5 = feats[13:]   # stride 32, 960 ch
 
-        self.up4 = _ConvBlock(960 + 112, 256)
-        self.up3 = _ConvBlock(256 + 40, 128)
-        self.up2 = _ConvBlock(128 + 24, 64)
+        self.proj5 = nn.Conv2d(960, 128, kernel_size=1, bias=False)
+        self.up4 = _ConvBlock(128 + 112, 128)
+        self.up3 = _ConvBlock(128 + 40, 96)
+        self.up2 = _ConvBlock(96 + 24, 64)
         self.up1 = _ConvBlock(64 + 16, 48)
 
         self.corner_head = nn.Sequential(
@@ -175,7 +173,7 @@ class CornerHeatmapUNet(nn.Module):
         s2 = self.enc2(s1)
         s3 = self.enc3(s2)
         s4 = self.enc4(s3)
-        s5 = self.enc5(s4)
+        s5 = self.proj5(self.enc5(s4))
 
         d4 = self.up4(torch.cat([F.interpolate(s5, size=s4.shape[-2:], mode="bilinear", align_corners=False), s4], dim=1))
         d3 = self.up3(torch.cat([F.interpolate(d4, size=s3.shape[-2:], mode="bilinear", align_corners=False), s3], dim=1))

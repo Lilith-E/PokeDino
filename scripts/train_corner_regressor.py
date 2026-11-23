@@ -173,6 +173,14 @@ class CornerPatchDataset(Dataset):
         patch_corners = (np.hstack([corners_gt, ones]) @ M_sim.T).astype(np.float32)
 
         if self.augment:
+            # Synthetic transparent sleeve / toploader outer rim outside card corners
+            if self.rng.random() < 0.30:
+                ctr_p = patch_corners.mean(axis=0)
+                exp_scale = float(self.rng.uniform(1.04, 1.12))
+                sleeve_q = ((patch_corners - ctr_p) * exp_scale + ctr_p).astype(np.int32)
+                overlay = patch_bgr.copy()
+                cv2.polylines(overlay, [sleeve_q.reshape(-1, 1, 2)], True, (225, 232, 240), int(self.rng.integers(2, 5)), cv2.LINE_AA)
+                patch_bgr = cv2.addWeighted(patch_bgr, 0.55, overlay, 0.45, 0)
             patch_bgr = self._photometric_aug(patch_bgr)
 
         rgb = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
@@ -237,7 +245,8 @@ def main() -> None:
         train_samples = train_samples[: args.max_train]
     logger.info("Loaded corner datasets: train=%d, val=%d on device=%s", len(train_samples), len(val_samples), device)
 
-    cv2.setNumThreads(1)
+    cv2.setNumThreads(2)
+    torch.set_num_threads(2)
     train_ds = CornerPatchDataset(train_samples, augment=True, seed=42)
     val_ds = CornerPatchDataset(val_samples, augment=False, seed=99)
     val_cache = [val_ds[i] for i in range(len(val_ds))]
