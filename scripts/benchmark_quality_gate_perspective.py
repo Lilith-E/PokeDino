@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 def _gather_real_images() -> list[tuple[str, Path]]:
     exts = {".jpg", ".jpeg", ".png", ".webp"}
     folders = [
+        ("prospective-warp", PROJECT_ROOT / "experiments" / "prospective-warp"),
         ("quality-gate-tests", PROJECT_ROOT / "experiments" / "quality-gate-tests"),
         ("synthetic-to-real", PROJECT_ROOT / "experiments" / "synthetic-to-real"),
         ("two-cards", PROJECT_ROOT / "experiments" / "two-cards"),

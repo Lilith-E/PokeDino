@@ -47,6 +47,7 @@ class CardDetector:
         adaptive_tta: bool = False,
         adaptive_tta_conf: float = 0.75,
         use_pbl: bool = True,
+        corner_regressor_weights: Optional[str] = None,
     ):
         from ultralytics import YOLO
 
@@ -60,6 +61,12 @@ class CardDetector:
         self.adaptive_tta_conf = adaptive_tta_conf
         self.use_pbl = use_pbl
         self.target_h, self.target_w = target_size
+        self._corner_regressor = None
+        if corner_regressor_weights is not None:
+            from backend.corner_regressor import CornerHeatmapRegressor
+
+            self._corner_regressor = CornerHeatmapRegressor(corner_regressor_weights)
+            self.use_pbl = False
 
         if weights_path is None:
             weights_path = self._find_latest_weights()
@@ -687,7 +694,11 @@ class CardDetector:
             return None, q
 
     def _refine_warp(self, img_bgr: np.ndarray, corners: np.ndarray):
-        """Refine OBB quadrilateral using unified scale-invariant boundary DP + joint IRLS."""
+        """Refine OBB quadrilateral via 4-Corner Heatmap Regressor or unified boundary DP."""
+        if self._corner_regressor is not None:
+            pred = self._corner_regressor.predict_from_proposal(img_bgr, corners)
+            if pred.rectified_rgb is not None:
+                return pred.rectified_rgb, pred.scene_corners
         refined_corners = refine_card_quad(
             img_bgr=img_bgr,
             quad=corners,
@@ -740,13 +751,18 @@ def build_card_detector(backend: Optional[str] = None, **kwargs):
 
     cfg = load_config()
     selected = backend or cfg.get("detector", {}).get("backend", "obb_pbl")
-    if selected == "obb_pbl":
+    if selected in ("obb_pbl", "obb_corner"):
         obb_inf = cfg.get("obb", {}).get("inference", {})
+        cr_weights = None
+        if selected == "obb_corner":
+            cr_cfg = cfg.get("detector", {}).get("corner_regressor", {})
+            cr_weights = kwargs.get("corner_regressor_weights", cr_cfg.get("weights", "data/weights/corner_heatmap_best.pt"))
         return CardDetector(
             conf=float(kwargs.get("conf", obb_inf.get("conf", 0.12))),
             iou=float(kwargs.get("iou", obb_inf.get("iou", 0.45))),
             max_det=int(kwargs.get("max_det", obb_inf.get("max_det", 10))),
             weights_path=kwargs.get("weights_path"),
+            corner_regressor_weights=cr_weights,
         )
     if selected == "obb_unet":
         from backend.seg_detector import OBBCanonicalUNetDetector
