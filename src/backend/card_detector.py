@@ -754,14 +754,21 @@ def build_card_detector(backend: Optional[str] = None, **kwargs):
     if selected in ("obb_pbl", "obb_corner"):
         obb_inf = cfg.get("obb", {}).get("inference", {})
         cr_weights = None
+        w_override = kwargs.get("weights_path")
         if selected == "obb_corner":
             cr_cfg = cfg.get("detector", {}).get("corner_regressor", {})
             cr_weights = kwargs.get("corner_regressor_weights", cr_cfg.get("weights", "data/weights/corner_heatmap_best.pt"))
+            if w_override is None and cr_cfg.get("obb_weights"):
+                cand_w = Path(str(cr_cfg["obb_weights"]))
+                if not cand_w.is_absolute():
+                    cand_w = Path(__file__).resolve().parents[2] / cand_w
+                if cand_w.exists():
+                    w_override = str(cand_w)
         return CardDetector(
             conf=float(kwargs.get("conf", obb_inf.get("conf", 0.12))),
             iou=float(kwargs.get("iou", obb_inf.get("iou", 0.45))),
             max_det=int(kwargs.get("max_det", obb_inf.get("max_det", 10))),
-            weights_path=kwargs.get("weights_path"),
+            weights_path=w_override,
             corner_regressor_weights=cr_weights,
         )
     if selected == "obb_unet":

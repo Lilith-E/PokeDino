@@ -105,7 +105,7 @@ async def get_status():
     selected_backend = get_selected_backend()
     active_cd = _card_detectors.get(selected_backend)
     status["detector_backend"] = selected_backend
-    status["available_backends"] = ["obb_pbl", "obb_unet", "seg_yolo", "seg_zeroshot", "seg_semantic"]
+    status["available_backends"] = ["obb_unet", "obb_corner", "obb_pbl", "seg_yolo", "seg_zeroshot", "seg_semantic"]
     status["obb_weights"] = getattr(active_cd, "weights_path", None) if active_cd else None
     status["active_reference"] = _manual_reference_info
     status["quality_gate"] = {
@@ -253,7 +253,7 @@ async def get_reference_image(card_id: str):
 @app.post("/detect", tags=["Pipeline"])
 async def detect_cards(
     file: UploadFile = File(..., description="Scene photograph containing cards"),
-    backend: Optional[str] = Query(None, description="Detector backend: obb_pbl | obb_unet | seg_yolo | seg_zeroshot | seg_semantic"),
+    backend: Optional[str] = Query(None, description="Detector backend: obb_unet | obb_corner | obb_pbl | seg_yolo | seg_zeroshot | seg_semantic"),
 ):
     """Detects oriented cards in a raw scene photograph using the selected backend."""
     tmp_path = UPLOAD_DIR / f"scene_{file.filename or 'scene.jpg'}"
@@ -312,7 +312,7 @@ async def analyze_card(
     dead_zone: Optional[float] = Query(None, ge=0.0, le=1.0, description="Dead zone noise threshold (0.0 - 1.0)"),
     gamma: Optional[float] = Query(None, ge=0.1, le=5.0, description="Gamma correction exponent (e.g. 2.0)"),
     few_shot: Optional[bool] = Query(True, description="Use Few-Shot (photometric variants) or One-Shot (single scan)"),
-    backend: Optional[str] = Query(None, description="Detector backend: obb_pbl | obb_unet | seg_yolo | seg_zeroshot | seg_semantic"),
+    backend: Optional[str] = Query(None, description="Detector backend: obb_unet | obb_corner | obb_pbl | seg_yolo | seg_zeroshot | seg_semantic"),
 ):
     """Executes the full card condition grading pipeline."""
     if not detector.memory_bank_ready or not _manual_reference_info:

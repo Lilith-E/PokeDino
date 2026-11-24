@@ -534,6 +534,32 @@ class OBBCanonicalUNetDetector:
                 return str(p)
         raise FileNotFoundError("No YOLO-OBB weights found for OBBCanonicalUNetDetector.")
 
+    def refine_proposal(self, img_bgr: np.ndarray, obb_corners: np.ndarray):
+        """Run Stage-2 Canonical UNet border refinement and rectification from one Stage-1 quad."""
+        canon_bgr, _, M_canon_inv = warp_to_canonical_obb(
+            img_bgr,
+            obb_corners,
+            canon_size=(self.canon_h, self.canon_w),
+            target_size=self.target_size,
+        )
+        tensor = bgr_to_imagenet_tensor(canon_bgr, (self.canon_h, self.canon_w), self.device)
+        with torch.inference_mode():
+            logits = self.refiner(tensor)
+            prob_canon = torch.sigmoid(logits)[0, 0].cpu().numpy()
+
+        return rectify_from_canonical_prob(
+            img_bgr=img_bgr,
+            obb_corners=obb_corners,
+            prob_canon=prob_canon,
+            M_canon_inv=M_canon_inv,
+            target_size=self.target_size,
+            corridor_px=self.corridor_px,
+            corner_excl_frac=self.corner_excl_frac,
+            erode_mask_px=self.erode_mask_px,
+            feather_px=self.feather_px,
+            antialiased_warp=self.antialiased_warp,
+        )
+
     def detect(self, img_bgr) -> list[CardDetection]:
         """Run Stage-1 OBB proposals then Stage-2 Canonical UNet border refinement."""
         if isinstance(img_bgr, (str, Path)):
@@ -544,29 +570,7 @@ class OBBCanonicalUNetDetector:
         proposals = self.obb_detector.propose_quads(img_bgr)
         detections: list[CardDetection] = []
         for prop in proposals:
-            canon_bgr, _, M_canon_inv = warp_to_canonical_obb(
-                img_bgr,
-                prop["corners"],
-                canon_size=(self.canon_h, self.canon_w),
-                target_size=self.target_size,
-            )
-            tensor = bgr_to_imagenet_tensor(canon_bgr, (self.canon_h, self.canon_w), self.device)
-            with torch.inference_mode():
-                logits = self.refiner(tensor)
-                prob_canon = torch.sigmoid(logits)[0, 0].cpu().numpy()
-
-            res = rectify_from_canonical_prob(
-                img_bgr=img_bgr,
-                obb_corners=prop["corners"],
-                prob_canon=prob_canon,
-                M_canon_inv=M_canon_inv,
-                target_size=self.target_size,
-                corridor_px=self.corridor_px,
-                corner_excl_frac=self.corner_excl_frac,
-                erode_mask_px=self.erode_mask_px,
-                feather_px=self.feather_px,
-                antialiased_warp=self.antialiased_warp,
-            )
+            res = self.refine_proposal(img_bgr, prop["corners"])
             if res is None:
                 continue
             detections.append(

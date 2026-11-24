@@ -18,8 +18,9 @@ paths:
 # -- Modulo 1: Rilevamento della carta (YOLO OBB) -----------------------------
 # -- Modulo 1: Rilevamento della carta (YOLO OBB) -----------------------------
 detector:
-  backend: obb_pbl              # obb_pbl | obb_corner | obb_unet | seg_yolo | seg_zeroshot | seg_semantic
+  backend: obb_unet             # obb_pbl | obb_corner | obb_unet | seg_yolo | seg_zeroshot | seg_semantic
   corner_regressor:
+    obb_weights: data/weights/yolo11l_obb_heavy_best.pt
     weights: data/weights/corner_heatmap_best.pt
     patch_hw: [512, 384]
     pad_frac: 0.24

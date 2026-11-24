@@ -1190,8 +1190,9 @@
           <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
             <select id="detectorBackendSelect" title="Detector / Segmentation Backend"
               style="background: var(--bg-surface); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 9px 12px; font-size: 0.82rem; font-family: inherit;">
+              <option value="obb_unet">Recommended: YOLO11l-OBB Heavy + Canonical UNet</option>
+              <option value="obb_corner">Experimental: YOLO11l-OBB Heavy + 4-Corner Heatmap</option>
               <option value="obb_pbl">Baseline: YOLO11s-OBB + PBL</option>
-              <option value="obb_unet">Two-Stage: YOLO11m-OBB + Canonical UNet</option>
               <option value="seg_yolo">Seg: YOLO11s-Seg</option>
               <option value="seg_zeroshot">Seg: Zero-Shot (YOLOE)</option>
               <option value="seg_semantic">Seg: MobileNetV3-UNet (640px)</option>

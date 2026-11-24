@@ -46,6 +46,8 @@ def main() -> int:
         backends_to_test.append("seg_semantic")
     if (PROJECT_ROOT / "data" / "weights" / "seg_canonical_unet_best.pt").exists():
         backends_to_test.append("obb_unet")
+    if (PROJECT_ROOT / "data" / "weights" / "corner_heatmap_best.pt").exists():
+        backends_to_test.append("obb_corner")
 
     summary = []
     for bk in backends_to_test:

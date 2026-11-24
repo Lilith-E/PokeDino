@@ -31,7 +31,6 @@ for p in (PROJECT_ROOT / "src", PROJECT_ROOT):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from backend.card_detector import CardDetector  # noqa: E402
 from backend.corner_regressor import (  # noqa: E402
     PAD_FRAC,
     PATCH_H,
@@ -47,12 +46,11 @@ from backend.rectifier import (  # noqa: E402
     refine_card_quad,
     warp_perspective_antialiased,
 )
+from backend.seg_detector import OBBCanonicalUNetDetector  # noqa: E402
 from scripts.benchmark_quality_gate_perspective import _gather_real_images  # noqa: E402
 from scripts.benchmark_same_bbox_perspective import (  # noqa: E402
     CORNER_COLORS_BGR,
     CORNER_NAMES,
-    _load_gt_corners_yolo_obb,
-    _load_gt_mask_yolo_seg,
     _summarize_errs,
 )
 from scripts.benchmark_segmentation_vs_obb import (  # noqa: E402
@@ -147,10 +145,15 @@ def _render_patch_board(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Direct patch-level comparison: Raw OBB vs DP-IRLS vs 4-Corner Heatmap")
+    parser = argparse.ArgumentParser(
+        description="Direct patch-level comparison: Raw OBB vs DP-IRLS vs Canonical UNet vs 4-Corner Heatmap"
+    )
+    parser.add_argument("--obb-weights", type=str, default=None)
+    parser.add_argument("--unet-weights", type=str, default=None)
     parser.add_argument("--weights", type=str, default="data/weights/corner_heatmap_best.pt")
     parser.add_argument("--max-synth-scenes", type=int, default=200)
     parser.add_argument("--only-folder", type=str, default="")
+    parser.add_argument("--skip-real", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -161,24 +164,41 @@ def main() -> None:
     out_dir = PROJECT_ROOT / "report" / "figures" / "05_segmentation_pipeline" / "patch_corner_regressor"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    det_obb = CardDetector(
+    ou_cfg = cfg.get("detector", {}).get("obb_unet", {})
+    obb_weights = args.obb_weights or ou_cfg.get("obb_weights", "data/weights/yolo11l_obb_heavy_best.pt")
+    unet_weights = args.unet_weights or ou_cfg.get("unet_weights", "data/weights/seg_canonical_unet_best.pt")
+
+    unet_det = OBBCanonicalUNetDetector(
+        obb_weights=obb_weights,
+        unet_weights=unet_weights,
         conf=float(cfg["obb"]["inference"]["conf"]),
         iou=float(cfg["obb"]["inference"]["iou"]),
         max_det=int(cfg["obb"]["inference"]["max_det"]),
-        use_pbl=False,
     )
+    det_obb = unet_det.obb_detector
     regressor = CornerHeatmapRegressor(PROJECT_ROOT / args.weights)
 
-    # 1. Quantitative benchmark on pokemon_seg/test (from identical frozen Raw OBB patch)
+    # 1. Quantitative benchmark on pokemon_seg/test single-card scenes (true perspective corners_gt)
     ds_root = PROJECT_ROOT / "data" / "datasets" / "pokemon_seg"
     img_dir = ds_root / "images" / "test"
-    lbl_obb_dir = ds_root / "labels_obb" / "test"
-    lbl_seg_dir = ds_root / "labels" / "test"
+    meta_dir = ds_root / "meta" / "test"
+    mask_dir = ds_root / "masks" / "test"
     all_imgs = sorted([p for p in img_dir.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png")])
-    pos_imgs = [p for p in all_imgs if (lbl_obb_dir / f"{p.stem}.txt").exists() and (lbl_obb_dir / f"{p.stem}.txt").read_text().strip()]
-    chosen = pos_imgs[: args.max_synth_scenes]
+    single_imgs = []
+    for p in all_imgs:
+        mp = meta_dir / f"{p.stem}.json"
+        if mp.exists():
+            meta = json.loads(mp.read_text())
+            if len(meta.get("cards", [])) == 1:
+                single_imgs.append(p)
+    chosen = single_imgs[: args.max_synth_scenes]
 
-    methods = ["1. Raw OBB", "2. Classical DP-IRLS (Peak 8-DOF)", "3. SOTA 4-Corner Heatmap"]
+    methods = [
+        "1. Raw OBB Heavy",
+        "2. Classical DP-IRLS (Peak 8-DOF)",
+        "3. Canonical UNet (obb_unet)",
+        "4. SOTA 4-Corner Heatmap (obb_corner)",
+    ]
     errs = {m: [] for m in methods}
     ious = {m: [] for m in methods}
     clips = {m: [] for m in methods}
@@ -186,27 +206,30 @@ def main() -> None:
     for p in chosen:
         img_bgr = cv2.imread(str(p), cv2.IMREAD_COLOR)
         h, w = img_bgr.shape[:2]
-        gt_quads = _load_gt_corners_yolo_obb(lbl_obb_dir / f"{p.stem}.txt", w, h)
-        gt_masks = _load_gt_mask_yolo_seg(lbl_seg_dir / f"{p.stem}.txt", w, h)
-        if not gt_quads or not gt_masks:
+        meta = json.loads((meta_dir / f"{p.stem}.json").read_text())
+        gt_mask_img = cv2.imread(str(mask_dir / f"{p.stem}.png"), cv2.IMREAD_GRAYSCALE)
+        if gt_mask_img is None:
             continue
-        gt_q = order_quad(gt_quads[0])
-        gt_m = gt_masks[0]
+        gt_q = order_quad(np.asarray(meta["cards"][0]["corners_gt"], dtype=np.float64))
+        gt_m = (gt_mask_img > 127).astype(np.float32)
         gt_u8 = (gt_m > 0.5).astype(np.uint8)
         gt_ring = (gt_u8 - cv2.erode(gt_u8, np.ones((9, 9), np.uint8))) > 0
         ring_area = max(float(gt_ring.sum()), 1.0)
 
-        dets = det_obb.detect(img_bgr)
-        if not dets:
+        props = det_obb.propose_quads(img_bgr)
+        if not props:
             continue
-        raw_q = order_quad(dets[0].corners)
+        raw_q = order_quad(props[0]["corners"])
         q_dp = refine_card_quad(img_bgr, raw_q, mask=None, outer_ramp_anchor=False, rigid_6dof_pose=False)
+        res_unet = unet_det.refine_proposal(img_bgr, raw_q)
+        q_unet = order_quad(res_unet.corners) if res_unet is not None else raw_q
         pred_hm = regressor.predict_from_proposal(img_bgr, raw_q)
 
         for m_name, q_pred in (
-            ("1. Raw OBB", raw_q),
+            ("1. Raw OBB Heavy", raw_q),
             ("2. Classical DP-IRLS (Peak 8-DOF)", q_dp),
-            ("3. SOTA 4-Corner Heatmap", pred_hm.scene_corners),
+            ("3. Canonical UNet (obb_unet)", q_unet),
+            ("4. SOTA 4-Corner Heatmap (obb_corner)", pred_hm.scene_corners),
         ):
             errs[m_name].append(align_corner_error(q_pred, gt_q))
             proj_m = project_patch_mask_to_scene(q_pred, np.ones((TARGET_H, TARGET_W), dtype=np.float32), (h, w))
@@ -219,17 +242,17 @@ def main() -> None:
     summary = {m: (_summarize_errs(errs[m], ious[m], clips[m]) if errs[m] else {"n": 0}) for m in methods}
 
     # 2. Direct patch-level visual comparison on real captures
-    real_items = _gather_real_images()
+    real_items = [] if args.skip_real else _gather_real_images()
     if args.only_folder:
         real_items = [(tag, p) for tag, p in real_items if tag == args.only_folder]
     for tag, img_path in real_items:
         img_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
         if img_bgr is None:
             continue
-        dets = det_obb.detect(img_bgr)
-        if not dets:
+        props = det_obb.propose_quads(img_bgr)
+        if not props:
             continue
-        raw_q = order_quad(dets[0].corners)
+        raw_q = order_quad(props[0]["corners"])
         patch_bgr, M_sim, _ = extract_oriented_padded_patch(img_bgr, raw_q, patch_hw=(PATCH_H, PATCH_W), pad_frac=PAD_FRAC)
 
         def _to_patch(q_scene: np.ndarray) -> np.ndarray:
@@ -237,15 +260,19 @@ def main() -> None:
             return (np.hstack([order_quad(q_scene), ones]) @ M_sim.T).astype(np.float64)
 
         q_dp = refine_card_quad(img_bgr, raw_q, mask=None, outer_ramp_anchor=False, rigid_6dof_pose=False)
+        res_unet = unet_det.refine_proposal(img_bgr, raw_q)
+        q_unet = order_quad(res_unet.corners) if res_unet is not None else raw_q
+        rect_unet_rgb = res_unet.patch_rgb if res_unet is not None else _warp_scene_quad(img_bgr, q_unet)
         pred_hm = regressor.predict_from_proposal(img_bgr, raw_q)
 
         variants = {
-            "1. Frozen Raw OBB": (_to_patch(raw_q), _warp_scene_quad(img_bgr, raw_q), None),
+            "1. Frozen Raw OBB Heavy": (_to_patch(raw_q), _warp_scene_quad(img_bgr, raw_q), None),
             "2. Classical DP-IRLS": (_to_patch(q_dp), _warp_scene_quad(img_bgr, q_dp), None),
-            "3. SOTA 4-Corner Heatmap": (pred_hm.patch_corners, pred_hm.rectified_rgb, pred_hm.heatmaps),
+            "3. Canonical UNet (obb_unet)": (_to_patch(q_unet), rect_unet_rgb, None),
+            "4. 4-Corner Heatmap (obb_corner)": (pred_hm.patch_corners, pred_hm.rectified_rgb, pred_hm.heatmaps),
         }
         _render_patch_board(
-            f"Direct Patch Comparison (Same Detector ROI) — {tag}/{img_path.name}",
+            f"Direct Patch Comparison (Same YOLO11l-OBB Heavy ROI) — {tag}/{img_path.name}",
             patch_bgr,
             variants,
             out_dir / f"patch_{img_path.stem}.png",
