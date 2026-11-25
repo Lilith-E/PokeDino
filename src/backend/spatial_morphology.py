@@ -98,12 +98,13 @@ def compute_spatial_knn_distances(
     coords_test: np.ndarray,
     coords_ref: np.ndarray,
     config: SpatialSearchConfig,
+    chunk_size: int = 512,
 ) -> np.ndarray:
-    """Computes anomaly distances under spatial constraints.
+    """Computes anomaly distances under spatial constraints using bounded-memory chunks.
 
     Cosine similarity minus spatial distance penalty. The maximum effective
     similarity (similarity - penalty) across valid reference patches is selected
-    for each test patch.
+    for each test patch without materializing full (N, M) intermediate arrays.
 
     Args:
         test_features: Tensor (N, D) of L2-normalized query features.
@@ -111,21 +112,42 @@ def compute_spatial_knn_distances(
         coords_test: Coordinates (N, 2) of query patches.
         coords_ref: Coordinates (M, 2) of reference patches.
         config: Spatial search configuration.
+        chunk_size: Number of query patches processed per chunk to bound RAM/VRAM.
 
     Returns:
         float32 numpy array (N,) of (1 - max_effective_similarity) clamped to [0, 1].
     """
-    sim = torch.mm(test_features, ref_features.T).cpu().numpy().astype(np.float32)
+    n_test = int(test_features.shape[0])
+    if n_test == 0:
+        return np.empty(0, dtype=np.float32)
 
-    if not config.enabled or config.penalty_weight <= 0.0:
-        max_sim = sim.max(axis=1)
-        return (1.0 - max_sim).clip(min=0.0).astype(np.float32)
+    device = test_features.device
+    ref_t = ref_features.T
+    use_spatial = bool(config.enabled and config.penalty_weight > 0.0 and config.radius_patches > 0.0)
+    if use_spatial:
+        c_test = torch.as_tensor(coords_test, dtype=torch.float32, device=device)
+        c_ref = torch.as_tensor(coords_ref, dtype=torch.float32, device=device)
+        c_ref_y = c_ref[:, 0].unsqueeze(0)
+        c_ref_x = c_ref[:, 1].unsqueeze(0)
+        radius = float(config.radius_patches)
+        weight = float(config.penalty_weight)
 
-    geo = spatial_distance_matrix(coords_test, coords_ref, config.radius_patches)
-    pen = spatial_penalty(geo, config.radius_patches, config.penalty_weight)
-    eff_sim = sim - pen
-    max_eff_sim = eff_sim.max(axis=1)
-    return (1.0 - max_eff_sim).clip(min=0.0).astype(np.float32)
+    out_chunks = []
+    with torch.inference_mode():
+        for start in range(0, n_test, max(1, int(chunk_size))):
+            end = min(n_test, start + max(1, int(chunk_size)))
+            sim = torch.mm(test_features[start:end], ref_t)
+            if use_spatial:
+                c_chunk = c_test[start:end]
+                dy = c_chunk[:, 0:1] - c_ref_y
+                dx = c_chunk[:, 1:2] - c_ref_x
+                geo = torch.sqrt(dy.square_().add_(dx.square_()))
+                pen = geo.sub_(radius).div_(radius).clamp_(0.0, 1.0).mul_(weight)
+                sim.sub_(pen)
+            max_sim = sim.max(dim=1).values
+            out_chunks.append((1.0 - max_sim).clamp_(min=0.0).cpu().numpy().astype(np.float32))
+
+    return np.concatenate(out_chunks, axis=0) if len(out_chunks) > 1 else out_chunks[0]
 
 @dataclass
 class MorphologyConfig:

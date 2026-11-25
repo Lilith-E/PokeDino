@@ -117,10 +117,15 @@ clahe:
 
 # -- Modulo 3: Rilevamento anomalie superficiali (DINOv2) ---------------------
 anomaly:
-  model: dinov2_vitb14
-  img_size: 448
+  model: dinov2_vitb14_reg
+  img_size: 518                # Native DINOv2 ViT-B/14-reg resolution (beats 672 in accuracy & 2.2x faster)
   target_size: [630, 448]
+  scale_with_resolution: true  # Proportions spatial radius & cluster area to img_size / 448
+  feature_layers: [5, 8, 11]   # Multi-layer ViT block averaging (mid-to-deep features)
   luma_matching: true          # Global exposure matching of the query toward the reference luminance
+  lab_color_matching: true     # Full LAB L + damped a,b white-balance normalization inside mask
+  subpixel_alignment: true     # ECC Euclidean sub-pixel alignment of query to reference template
+  patch_variance_norm: true    # Inverse self-variation weighting across the few-shot memory bank
   orientation_canonicalization: true  # Score 0/90/180/270 orientations, keep the best (rotation-invariant inspection)
   knn_neighbors: 1
   score_top_percent: 1.0       # Media dell'1% superiore delle distanze dei patch
@@ -160,8 +165,8 @@ condition:
 masking:
   enabled: true
   corner_radius_frac: 0.035    # Raggio di curvatura angoli relativo alla larghezza
-  erode_frac: 0.01             # Erosione perimetrale sottile (4 px su 448) per prevenire infiltrazioni dello sfondo
-  feather_px: 5                # Sfumatura gaussiana del bordo della maschera
+  erode_frac: 0.002            # Edge-preserving perimeter erosion (approx. 1 px on 448)
+  feather_px: 1                # Crisp Gaussian mask edge feathering
   sam:
     enabled: false
     model_type: sam2.1-hiera-small

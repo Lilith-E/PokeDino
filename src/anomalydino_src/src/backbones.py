@@ -83,6 +83,10 @@ class ViTWrapper(VisionTransformerWrapper):
     
 
 class DINOv2Wrapper(VisionTransformerWrapper):
+    def __init__(self, model_name, device, smaller_edge_size=224, half_precision=False, feature_layers=None):
+        self.feature_layers = tuple(feature_layers) if feature_layers else None
+        super().__init__(model_name, device, smaller_edge_size, half_precision)
+
     def load_model(self):
         model = torch.hub.load('facebookresearch/dinov2', self.model_name)
         model.eval()
@@ -116,7 +120,16 @@ class DINOv2Wrapper(VisionTransformerWrapper):
             else:
                 image_batch = image_tensor.unsqueeze(0).to(self.device)
 
-            tokens = self.model.get_intermediate_layers(image_batch)[0].squeeze()
+            if self.feature_layers and len(self.feature_layers) > 1:
+                layers = self.model.get_intermediate_layers(image_batch, n=list(self.feature_layers))
+                normed = [
+                    torch.nn.functional.normalize(layer.squeeze(0), p=2, dim=-1)
+                    for layer in layers
+                ]
+                tokens = torch.nn.functional.normalize(torch.stack(normed, dim=0).mean(dim=0), p=2, dim=-1)
+            else:
+                n_arg = list(self.feature_layers) if self.feature_layers else 1
+                tokens = self.model.get_intermediate_layers(image_batch, n=n_arg)[0].squeeze(0)
             
                 
         return tokens.cpu().numpy()
@@ -156,7 +169,7 @@ class DINOv2Wrapper(VisionTransformerWrapper):
             mask = np.ones_like(first_pc, dtype=bool)
         return mask.squeeze()
 
-def get_model(model_name, device, smaller_edge_size=448):
+def get_model(model_name, device, smaller_edge_size=448, feature_layers=None):
     print(f"Loading model: {model_name}")
     print(f"Device: {device}")
     print(f"Smaller edge size: {smaller_edge_size}")
@@ -164,6 +177,6 @@ def get_model(model_name, device, smaller_edge_size=448):
     if model_name.startswith("vit"):
         return ViTWrapper(model_name, device, smaller_edge_size)
     elif model_name.startswith("dinov2"):
-        return DINOv2Wrapper(model_name, device, smaller_edge_size)
+        return DINOv2Wrapper(model_name, device, smaller_edge_size, feature_layers=feature_layers)
     else:
         raise ValueError(f"Unknown model name: {model_name}")
