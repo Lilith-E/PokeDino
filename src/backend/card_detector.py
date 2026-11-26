@@ -13,6 +13,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from backend.rectifier import _subpixel_peak_1d, refine_card_quad, warp_perspective_antialiased
+
 logger = logging.getLogger(__name__)
 
 TARGET_H = 630
@@ -27,6 +29,7 @@ class CardDetection:
     confidence: float
     patch: np.ndarray
     patch_gray_score: float
+    mask: Optional[np.ndarray] = None
 
 class CardDetector:
     """YOLO OBB-based Pokémon card detector with perspective-warp cropping."""
@@ -41,6 +44,10 @@ class CardDetector:
         imgsz: int = 640,
         corner_shrink: float = 0.0,
         refine: bool = False,
+        adaptive_tta: bool = False,
+        adaptive_tta_conf: float = 0.75,
+        use_pbl: bool = True,
+        corner_regressor_weights: Optional[str] = None,
     ):
         from ultralytics import YOLO
 
@@ -50,7 +57,16 @@ class CardDetector:
         self.imgsz = imgsz
         self.corner_shrink = corner_shrink
         self.refine = refine
+        self.adaptive_tta = adaptive_tta
+        self.adaptive_tta_conf = adaptive_tta_conf
+        self.use_pbl = use_pbl
         self.target_h, self.target_w = target_size
+        self._corner_regressor = None
+        if corner_regressor_weights is not None:
+            from backend.corner_regressor import CornerHeatmapRegressor
+
+            self._corner_regressor = CornerHeatmapRegressor(corner_regressor_weights)
+            self.use_pbl = False
 
         if weights_path is None:
             weights_path = self._find_latest_weights()
@@ -107,25 +123,13 @@ class CardDetector:
                     best, best_error = candidate, error
         return best, best_error
 
-    def detect(self, img_bgr) -> list[CardDetection]:
-        """
-        Detect cards in a BGR scene (or image file path) and return warped upright patches.
-
-        Returns a list of CardDetection sorted by confidence (descending).
-        Enforces strict full-card geometry: discards partial sub-rectangles or split boxes.
-        """
-        if isinstance(img_bgr, (str, Path)):
-            img_bgr = cv2.imread(str(img_bgr))
-            if img_bgr is None:
-                return []
-
+    def propose_quads(self, img_bgr: np.ndarray) -> list[dict]:
+        """Run OBB detection (adaptive 1-view or 4-view TTA) and cluster quads."""
         h_img, w_img = img_bgr.shape[:2]
         img_area = float(h_img * w_img)
-
-        raw_candidates = []
+        raw_candidates: list[dict] = []
 
         def collect_candidates(view: np.ndarray, rotation: int = 0, offset=(0, 0)):
-            """Runs YOLO-OBB inference on a view and maps candidates back to unrotated coordinates."""
             result = self.model.predict(
                 view, conf=self.conf, iou=self.iou, max_det=self.max_det,
                 imgsz=self.imgsz, verbose=False
@@ -144,29 +148,48 @@ class CardDetector:
                 area_frac = (side_short * side_long) / max(img_area, 1.0)
                 if 1.15 <= ar <= 1.65 and area_frac >= 0.06:
                     score = float(conf) / (1.0 + 3.0 * abs(ar - TARGET_AR))
-                    raw_candidates.append({"corners": corners, "conf": float(conf), "ar": ar, "score": score})
+                    raw_candidates.append({
+                        "corners": corners,
+                        "conf": float(conf),
+                        "ar": ar,
+                        "area_frac": area_frac,
+                        "score": score,
+                    })
 
-        for rotation in range(4):
-            view = np.ascontiguousarray(np.rot90(img_bgr, rotation)) if rotation else img_bgr
-            collect_candidates(view, rotation)
-
+        collect_candidates(img_bgr, 0)
         needs_context = not raw_candidates
         for cand in raw_candidates:
             q = cand["corners"]
-            edge_margin = min(float(q[:, 0].min()), float(q[:, 1].min()),
-                              float(w_img - 1 - q[:, 0].max()), float(h_img - 1 - q[:, 1].max()))
-            rect = cv2.minAreaRect(q.astype(np.float32))
-            area_frac = rect[1][0] * rect[1][1] / max(img_area, 1.0)
-            if edge_margin < 12.0 or area_frac > 0.55:
+            edge_margin = min(
+                float(q[:, 0].min()), float(q[:, 1].min()),
+                float(w_img - 1 - q[:, 0].max()), float(h_img - 1 - q[:, 1].max()),
+            )
+            if edge_margin < 12.0 or cand["area_frac"] > 0.55:
                 needs_context = True
                 break
+
         if needs_context:
-            for rotation in range(4):
-                view = np.ascontiguousarray(np.rot90(img_bgr, rotation)) if rotation else img_bgr
-                view_h, view_w = view.shape[:2]
-                pad_h, pad_w = int(view_h * 0.08), int(view_w * 0.08)
-                padded = cv2.copyMakeBorder(view, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_REPLICATE)
-                collect_candidates(padded, rotation, (pad_w, pad_h))
+            pad_h, pad_w = int(h_img * 0.08), int(w_img * 0.08)
+            padded0 = cv2.copyMakeBorder(img_bgr, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_REPLICATE)
+            collect_candidates(padded0, 0, (pad_w, pad_h))
+
+        best_single = max(raw_candidates, key=lambda c: c["score"], default=None)
+        skip_rotations = (
+            self.adaptive_tta
+            and best_single is not None
+            and best_single["conf"] >= self.adaptive_tta_conf
+            and abs(best_single["ar"] - TARGET_AR) <= 0.14
+        )
+
+        if not skip_rotations:
+            for rotation in (1, 2, 3):
+                view = np.ascontiguousarray(np.rot90(img_bgr, rotation))
+                collect_candidates(view, rotation)
+                if needs_context:
+                    vh, vw = view.shape[:2]
+                    ph, pw = int(vh * 0.08), int(vw * 0.08)
+                    padded = cv2.copyMakeBorder(view, ph, ph, pw, pw, cv2.BORDER_REPLICATE)
+                    collect_candidates(padded, rotation, (pw, ph))
 
         raw_candidates.sort(key=lambda x: x["score"], reverse=True)
         clusters = []
@@ -205,8 +228,16 @@ class CardDetector:
             score = conf / (1.0 + 3.0 * abs(ar - TARGET_AR))
             kept_candidates.append({"corners": fused, "conf": conf, "ar": ar, "score": score})
         kept_candidates.sort(key=lambda x: x["score"], reverse=True)
-        kept_candidates = kept_candidates[:self.max_det]
+        return kept_candidates[:self.max_det]
 
+    def detect(self, img_bgr) -> list[CardDetection]:
+        """Detect cards in a BGR scene and return warped upright patches."""
+        if isinstance(img_bgr, (str, Path)):
+            img_bgr = cv2.imread(str(img_bgr))
+            if img_bgr is None:
+                return []
+
+        kept_candidates = self.propose_quads(img_bgr)
         detections: list[CardDetection] = []
         for cand in kept_candidates:
             corners = cand["corners"]
@@ -215,7 +246,8 @@ class CardDetector:
                 ctr = corners.mean(axis=0)
                 corners = ctr + (corners - ctr) * (1.0 - self.corner_shrink)
 
-            corners = self._lock_physical_card(img_bgr, corners)
+            if self.use_pbl:
+                corners = self._lock_physical_card(img_bgr, corners)
 
             if self.refine:
                 patch, corners = self._refine_warp(img_bgr, corners)
@@ -550,23 +582,29 @@ class CardDetector:
         gx = np.abs(cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3))
 
         def _sample_edge(mag, expected_pos, axis, s_out, s_in):
-            """Sample edge points along one border using directional gradient magnitude."""
+            """Sample edge points along one border using sub-pixel weighted gradient peaks."""
             pts = []
+            lo_idx = max(2, expected_pos - s_out)
+            hi_idx = min((H_pad - 3) if axis == 'h' else (W_pad - 3), expected_pos + s_in)
+            if hi_idx <= lo_idx + 2:
+                return np.empty((0, 2), dtype=np.float32)
+            dists = np.arange(lo_idx, hi_idx, dtype=np.float32) - float(expected_pos)
+            prior = np.exp(-0.5 * (dists / 10.0) ** 2)
             for t in np.linspace(0.18, 0.82, n_samples):
                 if axis == 'h':
                     x = int(pad + t * (target_w - 1))
-                    y_lo = max(2, expected_pos - s_out)
-                    y_hi = min(H_pad - 3, expected_pos + s_in)
-                    col = mag[y_lo:y_hi, x]
-                    if len(col) > 0 and col.max() > 25:
-                        pts.append([x, y_lo + int(np.argmax(col))])
+                    col = mag[lo_idx:hi_idx, x]
+                    if len(col) > 0:
+                        idx_m = int(np.argmax(col * prior))
+                        if float(col[idx_m]) > 25.0:
+                            pts.append([float(x), float(lo_idx) + _subpixel_peak_1d(col, idx_m)])
                 else:
                     y = int(pad + t * (target_h - 1))
-                    x_lo = max(2, expected_pos - s_out)
-                    x_hi = min(W_pad - 3, expected_pos + s_in)
-                    row = mag[y, x_lo:x_hi]
-                    if len(row) > 0 and row.max() > 25:
-                        pts.append([x_lo + int(np.argmax(row)), y])
+                    row = mag[y, lo_idx:hi_idx]
+                    if len(row) > 0:
+                        idx_m = int(np.argmax(row * prior))
+                        if float(row[idx_m]) > 25.0:
+                            pts.append([float(lo_idx) + _subpixel_peak_1d(row, idx_m), float(y)])
             return np.array(pts, dtype=np.float32) if pts else np.empty((0, 2), dtype=np.float32)
 
         top_pts = _sample_edge(gy, pad, 'h', search_out, search_in)
@@ -628,8 +666,8 @@ class CardDetector:
                 0.90 * target_h <= h_right <= 1.10 * target_h):
             return None, q
 
-        if (abs(w_top - w_bot) / max(w_top, w_bot, 1.0) > 0.035 or
-                abs(h_left - h_right) / max(h_left, h_right, 1.0) > 0.035):
+        if (abs(w_top - w_bot) / max(w_top, w_bot, 1.0) > 0.16 or
+                abs(h_left - h_right) / max(h_left, h_right, 1.0) > 0.16):
             return None, q
 
         try:
@@ -641,7 +679,14 @@ class CardDetector:
                 [0, 0], [target_w - 1, 0], [target_w - 1, target_h - 1], [0, target_h - 1]
             ], dtype=np.float32)
             M_final = cv2.getPerspectiveTransform(refined_corners.astype(np.float32), dst_final)
-            warped = cv2.warpPerspective(img_bgr, M_final, (target_w, target_h))
+            warped = warp_perspective_antialiased(
+                img_bgr,
+                M_final,
+                (target_w, target_h),
+                quad_corners=refined_corners,
+                flags=cv2.INTER_LANCZOS4,
+                border_mode=cv2.BORDER_REPLICATE,
+            )
             if warped is None or warped.mean() < 1:
                 return None, q
             return cv2.cvtColor(warped, cv2.COLOR_BGR2RGB), refined_corners
@@ -649,9 +694,19 @@ class CardDetector:
             return None, q
 
     def _refine_warp(self, img_bgr: np.ndarray, corners: np.ndarray):
-        """Snap the quad to edge evidence only when the correction stays within 5 px."""
-        patch, refined_corners = self._refine_quad_lines(img_bgr, corners)
-        if patch is not None and self._quad_distance(refined_corners, corners) <= 5.0:
+        """Refine OBB quadrilateral via 4-Corner Heatmap Regressor or unified boundary DP."""
+        if self._corner_regressor is not None:
+            pred = self._corner_regressor.predict_from_proposal(img_bgr, corners)
+            if pred.rectified_rgb is not None:
+                return pred.rectified_rgb, pred.scene_corners
+        refined_corners = refine_card_quad(
+            img_bgr=img_bgr,
+            quad=corners,
+            mask=None,
+            target_size=(self.target_h, self.target_w),
+        )
+        patch = self.warp_card(img_bgr, refined_corners)
+        if patch is not None:
             return patch, refined_corners
         return self.warp_card(img_bgr, corners), corners
 
@@ -664,7 +719,14 @@ class CardDetector:
             np.float32,
         )
         M = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
-        warped = cv2.warpPerspective(img_bgr, M, (self.target_w, self.target_h))
+        warped = warp_perspective_antialiased(
+            img_bgr,
+            M,
+            (self.target_w, self.target_h),
+            quad_corners=quad,
+            flags=cv2.INTER_LANCZOS4,
+            border_mode=cv2.BORDER_REPLICATE,
+        )
         if warped is None or warped.mean() < 1:
             return None
         return cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
@@ -681,3 +743,40 @@ class CardDetector:
             cv2.putText(vis, f"{d.confidence:.2f}", (cx - 20, cy - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         return vis
+
+
+def build_card_detector(backend: Optional[str] = None, **kwargs):
+    """Instantiate the configured card localization or segmentation backend."""
+    from backend.experiment import load_config
+
+    cfg = load_config()
+    selected = backend or cfg.get("detector", {}).get("backend", "obb_pbl")
+    if selected in ("obb_pbl", "obb_corner"):
+        obb_inf = cfg.get("obb", {}).get("inference", {})
+        cr_weights = None
+        w_override = kwargs.get("weights_path")
+        if selected == "obb_corner":
+            cr_cfg = cfg.get("detector", {}).get("corner_regressor", {})
+            cr_weights = kwargs.get("corner_regressor_weights", cr_cfg.get("weights", "data/weights/corner_heatmap_best.pt"))
+            if w_override is None and cr_cfg.get("obb_weights"):
+                cand_w = Path(str(cr_cfg["obb_weights"]))
+                if not cand_w.is_absolute():
+                    cand_w = Path(__file__).resolve().parents[2] / cand_w
+                if cand_w.exists():
+                    w_override = str(cand_w)
+        return CardDetector(
+            conf=float(kwargs.get("conf", obb_inf.get("conf", 0.12))),
+            iou=float(kwargs.get("iou", obb_inf.get("iou", 0.45))),
+            max_det=int(kwargs.get("max_det", obb_inf.get("max_det", 10))),
+            weights_path=w_override,
+            corner_regressor_weights=cr_weights,
+        )
+    if selected == "obb_unet":
+        from backend.seg_detector import OBBCanonicalUNetDetector
+
+        return OBBCanonicalUNetDetector(**kwargs)
+    if selected in ("seg_yolo", "seg_zeroshot", "seg_semantic"):
+        from backend.seg_detector import SegmentationCardDetector
+
+        return SegmentationCardDetector(backend=selected, **kwargs)
+    raise ValueError(f"Unknown detector backend: {selected}")

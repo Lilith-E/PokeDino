@@ -143,69 +143,90 @@ class ImageQualityGate:
         
         return 0.5 * lap_score + 0.5 * blur_score
     
-    def _compute_exposure(self, image: np.ndarray) -> float:
+    def _compute_exposure(
+        self,
+        image: np.ndarray,
+        valid_mask: Optional[np.ndarray] = None,
+    ) -> float:
         """Compute exposure quality based on clipped pixels and mean luminance.
-        
-        More aggressive penalty for clipping: clipped pixels are unrecoverable
-        detail loss, unlike a simple mean shift.
-        
+
         Args:
             image: Input image (BGR, uint8).
-            
+            valid_mask: Optional mask restricting evaluation to card foreground.
+
         Returns:
             Normalized exposure score [0, 1].
         """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        clipped_low = np.sum(gray < 10)
-        clipped_high = np.sum(gray > 245)
-        total_pixels = gray.size
+        if valid_mask is not None:
+            m = valid_mask >= 0.5
+            vals = gray[m] if np.any(m) else gray.ravel()
+        else:
+            vals = gray.ravel()
+
+        clipped_low = np.sum(vals < 10)
+        clipped_high = np.sum(vals > 245)
+        total_pixels = max(vals.size, 1)
         clipped_ratio = (clipped_low + clipped_high) / total_pixels
-        
-        mean_lum = float(np.mean(gray))
+
+        mean_lum = float(np.mean(vals))
         mean_deviation = abs(mean_lum - 128) / 128
-        
+
         clipped_score = 1.0 - np.clip(clipped_ratio * 10.0, 0.0, 1.0)
-        
         mean_score = 1.0 - np.clip(mean_deviation / 0.5, 0.0, 1.0)
-        
+
         return 0.6 * clipped_score + 0.4 * mean_score
-    
-    def _compute_glare(self, image: np.ndarray) -> float:
+
+    def _compute_glare(
+        self,
+        image: np.ndarray,
+        valid_mask: Optional[np.ndarray] = None,
+    ) -> float:
         """Compute glare coverage using HSV-based detection.
-        
-        Only blown-out specular highlights are counted (very high Value, low
-        Saturation). The high Value threshold avoids false positives on white
-        card borders, pale artwork and light backgrounds, which are bright but
-        not clipped by the sensor.
-        
+
         Args:
             image: Input image (BGR, uint8).
-            
+            valid_mask: Optional mask restricting evaluation to card foreground.
+
         Returns:
             Normalized glare score [0, 1] (1 = no glare, 0 = full glare).
         """
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        
         glare_mask = cv2.inRange(hsv, (0, 0, 240), (180, 40, 255))
-        glare_coverage = float(np.sum(glare_mask > 0)) / glare_mask.size
-        
+        if valid_mask is not None:
+            m = valid_mask >= 0.5
+            if np.any(m):
+                glare_coverage = float(np.sum(glare_mask[m] > 0)) / float(np.sum(m))
+            else:
+                glare_coverage = float(np.sum(glare_mask > 0)) / glare_mask.size
+        else:
+            glare_coverage = float(np.sum(glare_mask > 0)) / glare_mask.size
+
         return 1.0 - Helper.clamp(glare_coverage * 2, 0, 1)
-    
-    def _compute_noise(self, image: np.ndarray) -> float:
+
+    def _compute_noise(
+        self,
+        image: np.ndarray,
+        valid_mask: Optional[np.ndarray] = None,
+    ) -> float:
         """Compute noise level as std of residuals after Gaussian blur.
-        
+
         Args:
             image: Input image (BGR, uint8).
-            
+            valid_mask: Optional mask restricting evaluation to card foreground.
+
         Returns:
             Normalized noise score [0, 1] (1 = no noise, 0 = high noise).
         """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
         residuals = gray - blurred
-        noise_std = float(np.std(residuals))
-        
+        if valid_mask is not None:
+            m = valid_mask >= 0.5
+            noise_std = float(np.std(residuals[m])) if np.any(m) else float(np.std(residuals))
+        else:
+            noise_std = float(np.std(residuals))
+
         noise_score = 1.0 - Helper.normalize(noise_std, 0, 30)
         return noise_score
     
@@ -295,14 +316,16 @@ class ImageQualityGate:
         detection_confidence: float = 1.0,
         box_aspect_ratio: float = None,
         box_area_ratio: float = 0.5,
+        valid_mask: Optional[np.ndarray] = None,
     ) -> QualityResult:
-        """Evaluate image quality on YOLO OBB crop.
+        """Evaluate image quality on rectified card crop.
         
         Args:
             image: Cropped card image (BGR, uint8).
-            detection_confidence: YOLO detection confidence [0, 1].
+            detection_confidence: Detection confidence [0, 1].
             box_aspect_ratio: Aspect ratio of oriented box (height/width).
             box_area_ratio: Box area / frame area [0, 1].
+            valid_mask: Optional mask restricting photometric checks to card interior.
             
         Returns:
             QualityResult with aggregate score, pass/fail, and per-metric breakdown.
@@ -319,9 +342,9 @@ class ImageQualityGate:
         
         metrics = QualityMetrics()
         metrics.sharpness = self._compute_sharpness(image)
-        metrics.exposure = self._compute_exposure(image)
-        metrics.glare = self._compute_glare(image)
-        metrics.noise = self._compute_noise(image)
+        metrics.exposure = self._compute_exposure(image, valid_mask=valid_mask)
+        metrics.glare = self._compute_glare(image, valid_mask=valid_mask)
+        metrics.noise = self._compute_noise(image, valid_mask=valid_mask)
         metrics.resolution = self._compute_resolution(image)
         metrics.detection_confidence = detection_confidence
         

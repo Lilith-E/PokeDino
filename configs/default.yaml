@@ -16,6 +16,82 @@ paths:
   report_dir: report
 
 # -- Modulo 1: Rilevamento della carta (YOLO OBB) -----------------------------
+# -- Modulo 1: Rilevamento della carta (YOLO OBB) -----------------------------
+detector:
+  backend: obb_unet             # obb_pbl | obb_corner | obb_unet | seg_yolo | seg_zeroshot | seg_semantic
+  corner_regressor:
+    obb_weights: data/weights/yolo11l_obb_heavy_best.pt
+    weights: data/weights/corner_heatmap_best.pt
+    patch_hw: [512, 384]
+    pad_frac: 0.24
+  obb_unet:
+    obb_weights: data/weights/yolo11l_obb_heavy_best.pt
+    unet_weights: data/weights/seg_canonical_unet_best.pt
+    adaptive_tta: true
+    adaptive_tta_conf: 0.75
+    corridor_px: 28
+    canon_size: [768, 544]      # Divisible by 32; centers (630, 448) at 1:1 resolution with 48/69px pad
+    dataset:
+      name: pokemon_canon_refiner
+      n_train: 3500
+      n_val: 500
+      n_test: 500
+  rectifier:
+    edge_fit_method: ransac     # ransac | huber
+    corner_excl_frac: 0.14      # Fraction trimmed at each end of an edge to exclude rounded corners
+    min_side_inliers: 12
+    min_span_frac: 0.30         # Minimum normalized projection span covered by side inliers
+    max_side_tilt_rad: 0.20     # Max angle deviation (rad) of a fitted side relative to initial box
+    ransac_thresh_px: 2.5
+    ransac_iters: 120
+    erode_mask_px: 2            # Slight inward erosion of warped mask to suppress border bleed
+    feather_px: 3
+    refine_edges: true          # Snap proposals/masks to contrast-normalized image boundary energy
+    refine_iters: 2             # Coarse-to-fine canonical refinement passes
+    search_band_frac: 0.06      # Search corridor half-width as fraction of canonical short side
+    dp_smoothness_weight: 0.35  # 1D Dynamic Programming seam continuity weight
+    aspect_prior_weight: 0.15   # Soft projective 88:63 aspect-ratio regularization weight
+    outer_ramp_anchor: true     # Anchor seam to outward half-max slope to avoid border clipping
+    rigid_6dof_pose: true       # Constrain quad to exact 3D 63x88 planar perspective pose
+    antialiased_warp: true      # Mipmap/Gaussian pre-filter before warpPerspective when downsampling
+
+segmentation:
+  dataset:
+    name: pokemon_seg
+    imgsz: 640
+    split: [0.70, 0.15, 0.15]
+    hard_negative_ratio: 0.06
+    perspective_prob: 0.70
+    perspective_max_tilt: 0.18
+    occlusion_prob: 0.35
+    sleeve_prob: 0.25
+    full_art_prob: 0.25
+    tight_framing_prob: 0.25
+    corner_radius_frac: 0.045
+  yolo_seg:
+    weights: data/weights/yolo11s_seg_best.pt
+    weights_960: data/weights/yolo11s_seg_960_best.pt
+    base_model: yolo11s-seg.pt
+    imgsz: 640
+    conf: 0.25
+    iou: 0.45
+    max_det: 10
+    retina_masks: true
+    crop_refine: true           # Two-stage padded ROI crop + re-inference for sharper edges
+  zeroshot:
+    engine: yoloe               # yoloe | fastsam | sam2
+    model: yoloe-11s-seg.pt
+    fastsam_model: FastSAM-s.pt
+    text_prompts: ["trading card", "pokemon card", "playing card"]
+    imgsz: 640
+    conf: 0.15
+  semantic:
+    arch: unet_mobilenetv3
+    weights: data/weights/seg_semantic_best.pt
+    imgsz: 640
+    threshold: 0.50
+    min_area_frac: 0.04
+
 obb:
   dataset:
     name: pokemon_obb
@@ -117,15 +193,15 @@ clahe:
 
 # -- Modulo 3: Rilevamento anomalie superficiali (DINOv2) ---------------------
 anomaly:
-  model: dinov2_vitb14_reg
-  img_size: 518                # Native DINOv2 ViT-B/14-reg resolution (beats 672 in accuracy & 2.2x faster)
+  model: dinov2_vitb14           # Supports dinov2_vitb14 or dinov2_vitb14_reg
+  img_size: 448                  # Matches calibrated condition bands (518 supported with reg backbone)
   target_size: [630, 448]
-  scale_with_resolution: true  # Proportions spatial radius & cluster area to img_size / 448
-  feature_layers: [5, 8, 11]   # Multi-layer ViT block averaging (mid-to-deep features)
-  luma_matching: true          # Global exposure matching of the query toward the reference luminance
-  lab_color_matching: true     # Full LAB L + damped a,b white-balance normalization inside mask
-  subpixel_alignment: true     # ECC Euclidean sub-pixel alignment of query to reference template
-  patch_variance_norm: true    # Inverse self-variation weighting across the few-shot memory bank
+  scale_with_resolution: true    # Proportions spatial radius & cluster area to img_size / 448
+  feature_layers: null           # Optional multi-layer ViT block averaging (e.g. [5, 8, 11])
+  luma_matching: true            # Global exposure matching of the query toward the reference luminance
+  lab_color_matching: false      # Optional full LAB L + damped a,b white-balance normalization inside mask
+  subpixel_alignment: false      # Optional reference-guided bounded homography ECC in Stage 6
+  patch_variance_norm: false     # Optional inverse self-variation weighting across the few-shot memory bank
   orientation_canonicalization: true  # Score 0/90/180/270 orientations, keep the best (rotation-invariant inspection)
   knn_neighbors: 1
   score_top_percent: 1.0       # Media dell'1% superiore delle distanze dei patch

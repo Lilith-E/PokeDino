@@ -73,6 +73,7 @@ from backend.preprocessing import (
     match_color_and_luminance,
     match_luminance,
 )
+from backend.rectifier import align_patch_to_reference_homography, build_alignment_feature_map
 from backend.spatial_morphology import (
     MorphologyConfig,
     MorphologyResult,
@@ -331,6 +332,7 @@ class PokemonAnomalyDetector:
         self.feather_px = int(FEATHER_PX if feather_px is None else feather_px)
         self._ref_luma_stats: Optional[tuple[float, float]] = None
         self._ref_lab_stats: Optional[tuple[float, float, float, float, float, float]] = None
+        self._ref_align_map: Optional[np.ndarray] = None
         self._ref_gray_align: Optional[np.ndarray] = None
         self._patch_weights: Optional[np.ndarray] = None
         self._loading_reference: bool = False
@@ -485,7 +487,11 @@ class PokemonAnomalyDetector:
             borderMode=cv2.BORDER_REPLICATE,
         )
 
-    def _preprocess_with_mask(self, img_path: str):
+    def _preprocess_with_mask(
+        self,
+        img_path: str,
+        override_mask: Optional[np.ndarray] = None,
+    ):
         """Loads, resizes, optionally aligns, color-matches, and masks image with guided CLAHE."""
         img = cv2.imread(img_path, cv2.IMREAD_COLOR)
         if img is None:
@@ -495,16 +501,31 @@ class PokemonAnomalyDetector:
         target_h, target_w = self._processing_size
         img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
-        if self.subpixel_alignment and not self._loading_reference:
-            img = self._align_query_subpixel(img)
+        if not self.masking_enabled:
+            mask = None
+        elif override_mask is not None:
+            mask = override_mask.astype(np.float32)
+            if mask.shape[:2] != (target_h, target_w):
+                mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            mask = np.clip(mask, 0.0, 1.0)
+        else:
+            mask = self._build_mask(img.shape)
 
-        mask = self._build_mask(img.shape)
+        if self.subpixel_alignment and not self._loading_reference:
+            if self._ref_align_map is not None:
+                img, aligned_mask, _ = align_patch_to_reference_homography(
+                    img, self._ref_align_map, mask=mask if override_mask is not None else None
+                )
+                if override_mask is not None and aligned_mask is not None:
+                    mask = aligned_mask
+            elif self._ref_gray_align is not None:
+                img = self._align_query_subpixel(img)
+
         if not self._loading_reference:
             if self.lab_color_matching and self._ref_lab_stats is not None:
                 img = match_color_and_luminance(img, self._ref_lab_stats, alpha_ab=0.65, mask=mask)
             elif self.luma_matching_enabled and self._ref_luma_stats is not None:
                 img = match_luminance(img, *self._ref_luma_stats)
-
         if self.clahe_enabled:
             if mask is not None:
                 img = apply_clahe_masked(
@@ -545,6 +566,7 @@ class PokemonAnomalyDetector:
             self.few_shot_variants = []
             self._ref_luma_stats = None
             self._ref_lab_stats = None
+            self._ref_align_map = None
             self._ref_gray_align = None
             self._patch_weights = None
             logger.info("Updated card_id: %s. Memory bank reset.", card_id)
@@ -566,17 +588,23 @@ class PokemonAnomalyDetector:
                 th, tw = self._processing_size
                 base_img = cv2.resize(base_img, (tw, th), interpolation=cv2.INTER_LANCZOS4)
                 base_mask = self._build_mask(base_img.shape)
-                self._ref_luma_stats = compute_luma_stats(base_img)
-                self._ref_lab_stats = compute_lab_stats(base_img, mask=base_mask)
-                self._ref_gray_align = cv2.GaussianBlur(
-                    cv2.resize(cv2.cvtColor(base_img, cv2.COLOR_RGB2GRAY), (224, 336), interpolation=cv2.INTER_AREA),
-                    (3, 3), 0,
-                )
-                logger.info("Reference photometric & alignment template prepared (L=%.1f, std=%.1f)", *self._ref_luma_stats)
+                if self.luma_matching_enabled or self.lab_color_matching:
+                    self._ref_luma_stats = compute_luma_stats(base_img)
+                    logger.info("Luma matching target (mean=%.1f, std=%.1f)", *self._ref_luma_stats)
+                if self.lab_color_matching:
+                    self._ref_lab_stats = compute_lab_stats(base_img, mask=base_mask)
+                if self.subpixel_alignment:
+                    self._ref_align_map = build_alignment_feature_map(base_img, align_size_wh=(224, 315))
+                    self._ref_gray_align = cv2.GaussianBlur(
+                        cv2.resize(cv2.cvtColor(base_img, cv2.COLOR_RGB2GRAY), (224, 336), interpolation=cv2.INTER_AREA),
+                        (3, 3), 0,
+                    )
+                    logger.info("Reference alignment template prepared")
             except Exception as e:
                 logger.warning("Reference stats/template setup failed: %s", e)
                 self._ref_luma_stats = None
                 self._ref_lab_stats = None
+                self._ref_align_map = None
                 self._ref_gray_align = None
 
         features_list = []
@@ -781,6 +809,7 @@ class PokemonAnomalyDetector:
         dead_zone: Optional[float] = None,
         gamma: Optional[float] = None,
         use_few_shot: Optional[bool] = None,
+        query_mask: Optional[np.ndarray] = None,
     ) -> dict:
         """Executes complete inspection on query image comparing against memory bank.
 
@@ -789,6 +818,7 @@ class PokemonAnomalyDetector:
             dead_zone: Instance-specific Dead Zone parameter.
             gamma: Instance-specific Gamma exponent.
             use_few_shot: If True uses 10-variant Few-Shot bank, else One-Shot.
+            query_mask: Optional dynamic pixel mask (H, W) aligned to query card.
 
         Returns:
             Dictionary containing anomaly metrics, condition grading, and Base64 heatmap.
@@ -811,7 +841,7 @@ class PokemonAnomalyDetector:
         )
 
         self.load_model()
-        img, mask = self._preprocess_with_mask(test_image_path)
+        img, mask = self._preprocess_with_mask(test_image_path, override_mask=query_mask)
 
         with torch.inference_mode():
             img_tensor, grid_size = self.model.prepare_image(img)
@@ -931,6 +961,7 @@ class PokemonAnomalyDetector:
             },
             "clahe_enabled": self.clahe_enabled,
             "masking_enabled": self.masking_enabled,
+            "subpixel_alignment": self.subpixel_alignment,
             "dead_zone": dz,
             "gamma": g,
             "few_shot": self.use_few_shot,
@@ -948,13 +979,13 @@ class PokemonAnomalyDetector:
         dead_zone: Optional[float] = None,
         gamma: Optional[float] = None,
         use_few_shot: Optional[bool] = None,
+        query_mask: Optional[np.ndarray] = None,
     ) -> dict:
-        """Analyzes a canonical RGB patch produced by OBB warp.
+        """Analyzes a canonical RGB patch produced by card warp or segmentation.
 
-        The OBB corner ordering is rotation-ambiguous, so when orientation
-        canonicalization is enabled all four in-plane orientations (0/90/180/270)
-        are scored and the orientation with the lowest anomaly score is kept.
-        This makes the inspection invariant to how the card was photographed.
+        The card orientation can be 0 or 180 degrees upright; when orientation
+        canonicalization is enabled upright orientations are scored and the
+        lowest anomaly score is retained.
         """
         import tempfile
 
@@ -966,11 +997,14 @@ class PokemonAnomalyDetector:
             p = np.rot90(patch_rgb, rot) if rot else patch_rgb
             if p.shape[0] < p.shape[1]:
                 continue
+            m_rot = (np.rot90(query_mask, rot).copy() if rot else query_mask) if query_mask is not None else None
             last_rot = rot
             with tempfile.TemporaryDirectory() as td:
                 pa = Path(td) / "patch.png"
                 cv2.imwrite(str(pa), cv2.cvtColor(np.ascontiguousarray(p), cv2.COLOR_RGB2BGR))
-                result = self.analyze_card(str(pa), dead_zone=dead_zone, gamma=gamma, use_few_shot=use_few_shot)
+                result = self.analyze_card(
+                    str(pa), dead_zone=dead_zone, gamma=gamma, use_few_shot=use_few_shot, query_mask=m_rot
+                )
             result["flipped"] = rot != 0
             result["rotation_index"] = rot
             if best is None or result["score"] < best["score"]:
@@ -979,10 +1013,13 @@ class PokemonAnomalyDetector:
 
         if best is not None and last_rot != best_rot:
             p = np.rot90(patch_rgb, best_rot) if best_rot else patch_rgb
+            m_rot = (np.rot90(query_mask, best_rot).copy() if best_rot else query_mask) if query_mask is not None else None
             with tempfile.TemporaryDirectory() as td:
                 pa = Path(td) / "patch.png"
                 cv2.imwrite(str(pa), cv2.cvtColor(np.ascontiguousarray(p), cv2.COLOR_RGB2BGR))
-                best = self.analyze_card(str(pa), dead_zone=dead_zone, gamma=gamma, use_few_shot=use_few_shot)
+                best = self.analyze_card(
+                    str(pa), dead_zone=dead_zone, gamma=gamma, use_few_shot=use_few_shot, query_mask=m_rot
+                )
             best["flipped"] = best_rot != 0
             best["rotation_index"] = best_rot
 
@@ -1011,7 +1048,13 @@ class PokemonAnomalyDetector:
                 with tempfile.TemporaryDirectory() as td:
                     pa = Path(td) / "patch.png"
                     cv2.imwrite(str(pa), self._last_raw_bgr)
-                    self.analyze_card(str(pa), dead_zone=dz, gamma=g, use_few_shot=few_shot)
+                    self.analyze_card(
+                        str(pa),
+                        dead_zone=dz,
+                        gamma=g,
+                        use_few_shot=few_shot,
+                        query_mask=self._last_mask,
+                    )
                 self._last_used_few_shot = few_shot
 
         h, w = self._last_patch.shape[:2]
@@ -1099,6 +1142,7 @@ class PokemonAnomalyDetector:
             "model_loaded": self.model is not None,
             "clahe_enabled": self.clahe_enabled,
             "masking_enabled": self.masking_enabled,
+            "subpixel_alignment": self.subpixel_alignment,
             "dead_zone": self.dead_zone,
             "gamma": self.gamma,
             "spatial_search": {
